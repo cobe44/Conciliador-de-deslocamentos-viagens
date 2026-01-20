@@ -98,7 +98,7 @@ def get_viagens_historico():
     conn = get_connection()
     query = """
         SELECT id, placa, data_inicio, data_fim, operacao, rota, num_cte, 
-               valor, distancia_total, tipo_viagem, observacao
+               valor, valor_km, distancia_total, tipo_viagem, observacao
         FROM viagens 
         ORDER BY data_inicio DESC
         LIMIT 100
@@ -376,7 +376,15 @@ with tab_fechamento:
                             num_cte = st.text_input("Nº CTEs (Use os botões acima)", value=cte_str, disabled=True, key="cte_final_display")
                         
                         with col2:
-                            valor = st.number_input("Valor (R$)", min_value=0.0, step=100.0, key="valor")
+                            col_val1, col_val2 = st.columns(2)
+                            with col_val1:
+                                valor = st.number_input("Valor Total (R$)", min_value=0.0, step=10.0, key="valor")
+                            with col_val2:
+                                valor_km = st.number_input("R$/KM", min_value=0.0, value=0.0, step=0.1, key="valor_km")
+                            
+                            if valor == 0 and valor_km > 0:
+                                val_calc = distancia_total * valor_km
+                                st.caption(f"Calculado: R$ {val_calc:.2f}")
                             
                             tipo_viagem = st.radio(
                                 "Tipo de Viagem *",
@@ -418,11 +426,16 @@ with tab_fechamento:
                             if tipo_viagem == "IMPRODUTIVA" and 'motivo_improd' in dir():
                                 obs_final = f"[{motivo_improd}] {observacao}".strip()
                             
+                            # Calcular valor final
+                            valor_final = float(valor)
+                            if valor_final == 0 and valor_km > 0:
+                                valor_final = float(distancia_total * valor_km)
+
                             # Inserir viagem
-                            ph_ins = get_placeholder(12)
+                            ph_ins = get_placeholder(13)
                             sql_ins = f"""
                                 INSERT INTO viagens 
-                                (placa, data_inicio, data_fim, tempo_total, tempo_parado, operacao, rota, num_cte, valor, distancia_total, tipo_viagem, observacao)
+                                (placa, data_inicio, data_fim, tempo_total, tempo_parado, operacao, rota, num_cte, valor, valor_km, distancia_total, tipo_viagem, observacao)
                                 VALUES ({ph_ins})
                             """
                             params_ins = (
@@ -434,7 +447,8 @@ with tab_fechamento:
                                 operacao,
                                 rota,
                                 num_cte,
-                                float(valor) if valor else 0.0,
+                                valor_final,
+                                float(valor_km),
                                 float(distancia_total),
                                 tipo_viagem,
                                 obs_final
@@ -580,6 +594,11 @@ with tab_historico:
             
             cols_viagens = ['id', 'placa', 'Data Início', 'Data Fim', 'operacao', 'rota', 'Distância', 'Valor', 'tipo_viagem', 'observacao']
             
+            # Formatar Valor por Km se existir na visualização
+            if 'valor_km' in df_viagens.columns:
+                 # Adicionar aos dados e colunas, se quiser mostrar
+                 pass
+
             st.dataframe(
                 df_viagens[cols_viagens].style.apply(highlight_tipo, axis=1),
                 use_container_width=True,
