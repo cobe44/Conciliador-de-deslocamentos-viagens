@@ -1,0 +1,19 @@
+
+# Ambientes e Dependências
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+
+# Banco de Dados e Secrets
+.env
+frota.db
+*.sqlite3
+
+# IDEs
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/secrets.toml
