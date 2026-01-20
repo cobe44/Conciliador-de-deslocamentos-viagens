@@ -3,7 +3,7 @@ name: Sincronização Automática Sascar
 on:
   schedule:
     # Rodar a cada 30 minutos
-    - cron: '*/30 * * * *'
+    - cron: '*/15 * * * *'
   workflow_dispatch:
     # Permite rodar manualmente pelo botão no GitHub
 
