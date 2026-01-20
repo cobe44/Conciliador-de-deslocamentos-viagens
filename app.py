@@ -320,7 +320,13 @@ with tab_fechamento:
                     # Mostrar resumo
                     col_res1, col_res2, col_res3, col_res4, col_res5 = st.columns(5)
                     with col_res1:
-                        st.metric("Período", f"{pd.to_datetime(data_inicio_viagem).strftime('%d/%m %H:%M')} - {pd.to_datetime(data_fim_viagem).strftime('%d/%m %H:%M')}")
+                        # Usar HTML para fonte menor
+                        data_ini_str = pd.to_datetime(data_inicio_viagem).strftime('%d/%m %H:%M')
+                        data_fim_str = pd.to_datetime(data_fim_viagem).strftime('%d/%m %H:%M')
+                        st.markdown(f"""
+                        <div style="font-size: 0.8rem; margin-bottom: 5px; color: #666;">Período</div>
+                        <div style="font-size: 0.9rem; font-weight: 600;">{data_ini_str} <br> {data_fim_str}</div>
+                        """, unsafe_allow_html=True)
                     with col_res2:
                         st.metric("Tempo Total", fmt_hhmm(tempo_total))
                     with col_res3:
@@ -596,6 +602,7 @@ with tab_historico:
             df_viagens['Data Início'] = pd.to_datetime(df_viagens['data_inicio']).dt.strftime('%d/%m/%Y %H:%M')
             df_viagens['Data Fim'] = pd.to_datetime(df_viagens['data_fim']).dt.strftime('%d/%m/%Y %H:%M')
             df_viagens['Valor'] = df_viagens['valor'].apply(lambda x: f"R$ {x:.2f}" if x else "-")
+            df_viagens['R$/KM'] = df_viagens['valor_km'].apply(lambda x: f"R$ {x:.2f}" if x and x > 0 else "-")
             df_viagens['Distância'] = df_viagens['distancia_total'].apply(lambda x: f"{x:.1f} km" if x else "-")
             
             # Colorir por tipo
@@ -605,12 +612,7 @@ with tab_historico:
                 else:
                     return ['background-color: #f8d7da'] * len(row)
             
-            cols_viagens = ['id', 'placa', 'Data Início', 'Data Fim', 'operacao', 'rota', 'Distância', 'Valor', 'tipo_viagem', 'observacao']
-            
-            # Formatar Valor por Km se existir na visualização
-            if 'valor_km' in df_viagens.columns:
-                 # Adicionar aos dados e colunas, se quiser mostrar
-                 pass
+            cols_viagens = ['id', 'placa', 'Data Início', 'Data Fim', 'operacao', 'rota', 'Distância', 'Valor', 'R$/KM', 'tipo_viagem', 'observacao']
 
             st.dataframe(
                 df_viagens[cols_viagens].style.apply(highlight_tipo, axis=1),
