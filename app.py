@@ -336,23 +336,34 @@ with tab_fechamento:
                     if 'ctes' not in st.session_state: st.session_state.ctes = []
 
                     def add_cte():
-                        val = st.session_state.get('new_cte_input', '').strip()
-                        if val:
-                            if val not in st.session_state.ctes:
-                                st.session_state.ctes.append(val)
-                            st.session_state.new_cte_input = "" # Limpar input
+                        num = st.session_state.get('new_cte_num', '').strip()
+                        val_str = st.session_state.get('new_cte_val', 0.0)
+                        
+                        try:
+                            val = float(val_str)
+                        except:
+                            val = 0.0
+                            
+                        if num and val > 0:
+                            # Verificar duplicidade
+                            if not any(c['numero'] == num for c in st.session_state.ctes):
+                                st.session_state.ctes.append({'numero': num, 'valor': val})
+                            st.session_state.new_cte_num = "" # Limpar input
+                            st.session_state.new_cte_val = 0.0
 
-                    c_cte1, c_cte2 = st.columns([3, 1])
-                    c_cte1.text_input("Novo CTE", key="new_cte_input", placeholder="Digite e clique no +", label_visibility="collapsed")
-                    c_cte2.button("➕ Adicionar", on_click=add_cte, use_container_width=True)
+                    c_cte1, c_cte2, c_cte3 = st.columns([2, 1, 1])
+                    c_cte1.text_input("Número CTE", key="new_cte_num", placeholder="Ex: 1234")
+                    c_cte2.number_input("Valor (R$)", min_value=0.0, step=100.0, key="new_cte_val")
+                    c_cte3.button("➕ Add", on_click=add_cte, use_container_width=True)
 
                     # Listar
                     if st.session_state.ctes:
                         st.caption("CTEs incluídos:")
                         # Chips removíveis
-                        cols = st.columns(4)
-                        for i, cte in enumerate(st.session_state.ctes):
-                            if cols[i % 4].button(f"🗑️ {cte}", key=f"del_cte_{i}", help="Clique para remover"):
+                        cols = st.columns(3)
+                        for i, item in enumerate(st.session_state.ctes):
+                            label = f"📄 {item['numero']} (R$ {item['valor']:.2f})"
+                            if cols[i % 3].button(f"🗑️ {label}", key=f"del_cte_{i}", help="Clique para remover"):
                                 st.session_state.ctes.pop(i)
                                 st.rerun()
                     else:
@@ -371,20 +382,22 @@ with tab_fechamento:
                             
                             rota = st.text_input("Rota", placeholder="Ex: Base > Granja X > Base", key="rota")
                             
-                            # Campo de CTE agora reflete a lista
-                            cte_str = ", ".join(st.session_state.ctes)
-                            num_cte = st.text_input("Nº CTEs (Use os botões acima)", value=cte_str, disabled=True, key="cte_final_display")
+                            # Campo de CTE agora reflete a lista (Apenas números para salvar)
+                            cte_lista = [c['numero'] for c in st.session_state.ctes]
+                            cte_str = ", ".join(cte_lista)
+                            num_cte = st.text_input("CTEs", value=cte_str, disabled=True, key="cte_final_display")
                         
                         with col2:
-                            col_val1, col_val2 = st.columns(2)
-                            with col_val1:
-                                valor = st.number_input("Valor Total (R$)", min_value=0.0, step=10.0, key="valor")
-                            with col_val2:
-                                valor_km = st.number_input("R$/KM", min_value=0.0, value=0.0, step=0.1, key="valor_km")
+                            # Calcular totais dos CTEs
+                            total_ctes = sum(c['valor'] for c in st.session_state.ctes)
                             
-                            if valor == 0 and valor_km > 0:
-                                val_calc = distancia_total * valor_km
-                                st.caption(f"Calculado: R$ {val_calc:.2f}")
+                            # Calcular Valor por KM
+                            valor_km_calc = total_ctes / distancia_total if distancia_total > 0 else 0.0
+                            
+                            st.metric("Valor Total (CTEs)", f"R$ {total_ctes:.2f}")
+                            st.metric("Valor por KM", f"R$ {valor_km_calc:.2f}/km")
+                            
+                            st.caption(f"ℹ️ O valor por km é calculado automaticamente baseado na distância ({distancia_total:.1f} km).")
                             
                             tipo_viagem = st.radio(
                                 "Tipo de Viagem *",
@@ -426,10 +439,10 @@ with tab_fechamento:
                             if tipo_viagem == "IMPRODUTIVA" and 'motivo_improd' in dir():
                                 obs_final = f"[{motivo_improd}] {observacao}".strip()
                             
-                            # Calcular valor final
-                            valor_final = float(valor)
-                            if valor_final == 0 and valor_km > 0:
-                                valor_final = float(distancia_total * valor_km)
+                            # Calcular valor final (Soma dos CTEs)
+                            valor_final = sum(c['valor'] for c in st.session_state.ctes)
+                            # Calcular Valor KM (para salvar no banco)
+                            valor_km_final = valor_final / distancia_total if distancia_total > 0 else 0.0
 
                             # Inserir viagem
                             ph_ins = get_placeholder(13)
@@ -448,7 +461,7 @@ with tab_fechamento:
                                 rota,
                                 num_cte,
                                 valor_final,
-                                float(valor_km),
+                                float(valor_km_final),
                                 float(distancia_total),
                                 tipo_viagem,
                                 obs_final
