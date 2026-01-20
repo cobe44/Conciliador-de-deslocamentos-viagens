@@ -12,7 +12,7 @@ except ImportError:
     GEOPY_AVAILABLE = False
     print("AVISO: geopy não instalado. Usando API IBGE como fallback.")
 
-from poi_data import POIS_TATUI, POIS_PASSOS, POIS_IPIGUA, POIS_NUPORANGA
+from poi_data import POIS_NUPORANGA
 
 from database import get_connection, get_pois, get_placeholder
 
@@ -47,17 +47,19 @@ def get_pois():
 
 def get_poi_name(lat, lon, pois=None, pois_dict=None):
     """
-    Retorna o nome do POI mais próximo das coordenadas fornecidas.
-    Busca: 1) banco de dados, 2) dicionários de POIs, 3) reverse geocoding.
+    Retorna o nome do local das coordenadas fornecidas.
+    Busca: 1) banco de dados, 2) Base Nuporanga, 3) reverse geocoding (cidade).
+    
+    NOTA: Fazendas foram removidas - agora usa apenas Base Nuporanga e nomes de cidades.
     
     Args:
         lat: Latitude
         lon: Longitude
         pois: Lista de POIs do banco [(id, nome, lat, lon, tipo, raio), ...]
-        pois_dict: Dicionário de POIs locais {nome: [(lat, lon), ...], ...}
+        pois_dict: Dicionário de POIs locais (não usado mais)
     
     Returns:
-        Nome do POI, cidade, ou "Em Trânsito" se nenhum encontrado
+        Nome da Base Nuporanga, cidade/UF, ou "Em Trânsito" se não encontrado
     """
     # Buscar no banco de dados primeiro
     if pois is None:
@@ -69,23 +71,14 @@ def get_poi_name(lat, lon, pois=None, pois_dict=None):
         if dist <= pradius:
             return pname
     
-    # Fallback: buscar nos dicionários de POIs locais
-    if pois_dict:
-        for name, coords_list in pois_dict.items():
-            for (p_lat, p_lon) in coords_list:
-                dist = haversine(lat, lon, p_lat, p_lon) * 1000
-                if dist <= 1000:  # Raio padrão de 1km
-                    return name
-    
-    # Tentar todos os dicionários de POIs (incluindo Nuporanga)
-    all_pois = {**POIS_TATUI, **POIS_PASSOS, **POIS_IPIGUA, **POIS_NUPORANGA}
-    for name, coords_list in all_pois.items():
+    # Verificar apenas a Base Nuporanga 
+    for name, coords_list in POIS_NUPORANGA.items():
         for (p_lat, p_lon) in coords_list:
             dist = haversine(lat, lon, p_lat, p_lon) * 1000
-            if dist <= 1000:
+            if dist <= 1000:  # Raio de 1km para a base
                 return name
     
-    # Fallback: IBGE API primeiro (mais preciso para Brasil), depois geopy
+    # Usar geocodificação reversa para obter nome da cidade
     cidade = reverse_geocode_ibge(lat, lon)
     if cidade and cidade != "Em Trânsito":
         return cidade
