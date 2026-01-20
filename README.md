@@ -1,4 +1,4 @@
-# Conciliador de Fretes V2
+# Conciliador de Fretes 
 
 Sistema robusto de gestão de telemetria para 30 caminhões com integração Sascar e processamento automático de viagens.
 
@@ -231,3 +231,4 @@ python -c "from database import manutencao_banco; manutencao_banco(15)"
 
 ---
 **Desenvolvido para gestão eficiente de frota avícola** 🚛🐔
+
