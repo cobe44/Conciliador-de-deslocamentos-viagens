@@ -48,7 +48,7 @@ intervalo_dias = st.sidebar.slider("Janela de Análise (Dias)", 1, 30, 7)
 
 # --- NAVEGAÇÃO PRINCIPAL ---
 st.header("Navegação")
-tab_overview, tab_individual, tab_fechamento, tab_historico = st.tabs(["🗺️ Visão Geral da Frota", "📊 Análise Individual", "📋 Fechamento de Viagens", "📚 Histórico & Gestão"])
+tab_overview, tab_fechamento, tab_historico = st.tabs(["🗺️ Visão Geral da Frota", "📋 Fechamento de Viagens", "📚 Histórico & Gestão"])
 
 # ========================================
 # TAB 1: VISÃO GERAL DA FROTA
