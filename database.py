@@ -9,8 +9,31 @@ try:
 except ImportError:
     pass
 
+# Tentar carregar secrets do Streamlit Cloud
+def get_database_url():
+    """Obtém a URL do banco de dados de várias fontes possíveis"""
+    # 1. Tentar Streamlit secrets primeiro (para Streamlit Cloud)
+    try:
+        import streamlit as st
+        if hasattr(st, 'secrets'):
+            # Tentar DATABASE_URL direto
+            if 'DATABASE_URL' in st.secrets:
+                return st.secrets['DATABASE_URL']
+            # Tentar componentes separados
+            if 'database' in st.secrets:
+                db = st.secrets['database']
+                # Codificar @ na senha como %40
+                from urllib.parse import quote_plus
+                password = quote_plus(db.get('password', ''))
+                return f"postgresql://{db['user']}:{password}@{db['host']}:{db['port']}/{db['database']}"
+    except Exception:
+        pass
+    
+    # 2. Variável de ambiente
+    return os.getenv("DATABASE_URL")
+
 # Detectar configuração de Banco
-DB_URL = os.getenv("DATABASE_URL")
+DB_URL = get_database_url()
 IS_POSTGRES = False
 
 if DB_URL and "postgres" in DB_URL:
@@ -22,6 +45,7 @@ if DB_URL and "postgres" in DB_URL:
         # Fallback ou Exit? Melhor avisar e continuar com SQLite se falhar?
         # User especificou URL, espera Postgres.
         pass
+
 
 DB_NAME = "frota.db"
 
