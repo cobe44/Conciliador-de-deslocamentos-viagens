@@ -37,7 +37,9 @@ def get_deslocamentos_pendentes(placa):
     conn = get_connection()
     query = f"""
         SELECT id, data_inicio, data_fim, km_inicial, km_final, distancia,
-               local_inicio, local_fim, tempo, tempo_ocioso, situacao
+               local_inicio, local_fim, tempo, tempo_ocioso, situacao,
+               COALESCE(tipo_parada, 'MOVIMENTO') as tipo_parada,
+               COALESCE(qtd_pontos, 0) as qtd_pontos
         FROM deslocamentos 
         WHERE placa = {get_placeholder(1)} AND status = 'PENDENTE'
         ORDER BY data_inicio
@@ -275,10 +277,15 @@ with tab_fechamento:
                 df_display['Tempo'] = df_desloc.apply(calc_duration, axis=1)
                 df_display['Parado'] = df_display['tempo_ocioso'].apply(format_minutes)
                 df_display['Situação'] = df_display['situacao'].apply(lambda x: '⏸ PARADO' if x == 'PARADO' else '▶ MOVIMENTO')
+                
+                # Mapear tipo de parada para ícones
+                tipo_icons = {'MOVIMENTO': '🚗', 'PARADA': '🅿️', 'PERDA_SINAL': '📡', 'RESET_ODOMETRO': '🔄'}
+                df_display['Tipo'] = df_display['tipo_parada'].apply(lambda x: tipo_icons.get(x, '❓') + ' ' + x if pd.notna(x) else '🚗 MOVIMENTO')
+                
                 df_display['Selecionar'] = False
                 
                 # Data editor para seleção
-                cols_editor = ['Selecionar', 'Situação', 'Data Início', 'Data Fim', 'Tempo', 'Parado', 'local_inicio', 'local_fim', 'Distância']
+                cols_editor = ['Selecionar', 'Tipo', 'Data Início', 'Data Fim', 'Tempo', 'Parado', 'local_inicio', 'local_fim', 'Distância']
                 df_edit = st.data_editor(
                     df_display[cols_editor],
                     column_config={
@@ -307,8 +314,17 @@ with tab_fechamento:
                     df_selected = df_desloc[df_desloc['id'].isin(selected_ids)]
                     data_inicio_viagem = df_selected['data_inicio'].min()
                     data_fim_viagem = df_selected['data_fim'].max()
-                    # Converter para float nativo Python (evita erro np.float64 no PostgreSQL)
-                    distancia_total = float(df_selected['distancia'].sum())
+                    
+                    # CORREÇÃO: Usar subtração do odômetro (último - primeiro) para precisão
+                    km_primeiro = float(df_selected['km_inicial'].min())
+                    km_ultimo = float(df_selected['km_final'].max())
+                    distancia_total = km_ultimo - km_primeiro
+                    
+                    # Fallback se odômetro inválido (reset, erro, etc)
+                    if distancia_total <= 0:
+                        distancia_total = float(df_selected['distancia'].sum())
+                        st.warning("⚠️ Distância calculada pela soma dos trechos (odômetro inválido)")
+                    
                     tempo_total = float(df_selected['tempo'].sum()) if 'tempo' in df_selected.columns else 0.0
                     tempo_parado = float(df_selected['tempo_ocioso'].sum()) if 'tempo_ocioso' in df_selected.columns else 0.0
                     
