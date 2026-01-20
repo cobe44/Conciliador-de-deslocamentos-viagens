@@ -128,7 +128,7 @@ def init_db():
         )
     ''')
 
-    # Tabela: Deslocamentos
+    # Tabela: Deslocamentos (v2 - com campos adicionais para rastreabilidade)
     c.execute(f'''
         CREATE TABLE IF NOT EXISTS deslocamentos (
             id {TYPE_PK_AUTO},
@@ -143,6 +143,10 @@ def init_db():
             tempo REAL DEFAULT 0,
             tempo_ocioso REAL DEFAULT 0,
             situacao TEXT DEFAULT 'MOVIMENTO',
+            tipo_parada TEXT DEFAULT 'MOVIMENTO',
+            qtd_pontos INTEGER DEFAULT 0,
+            raw_id_inicio INTEGER,
+            raw_id_fim INTEGER,
             status TEXT DEFAULT 'PENDENTE',
             viagem_id INTEGER,
             FOREIGN KEY(viagem_id) REFERENCES viagens(id)
@@ -238,5 +242,38 @@ def get_pois():
     conn.close()
     return rows
 
+def migrate_db():
+    """
+    Migração segura: Adiciona novas colunas se não existirem.
+    Pode ser executado várias vezes sem problemas.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    
+    # Lista de migrações: (nome_coluna, definição_sql)
+    migrations = [
+        ("tipo_parada", "TEXT DEFAULT 'MOVIMENTO'"),
+        ("qtd_pontos", "INTEGER DEFAULT 0"),
+        ("raw_id_inicio", "INTEGER"),
+        ("raw_id_fim", "INTEGER"),
+    ]
+    
+    for col_name, col_def in migrations:
+        try:
+            if IS_POSTGRES:
+                c.execute(f"ALTER TABLE deslocamentos ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
+            else:
+                # SQLite não tem IF NOT EXISTS para ADD COLUMN
+                c.execute(f"ALTER TABLE deslocamentos ADD COLUMN {col_name} {col_def}")
+        except Exception as e:
+            # Coluna já existe (SQLite lança erro)
+            if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
+                print(f"⚠️ Migração {col_name}: {e}")
+    
+    conn.commit()
+    conn.close()
+    print("✅ Migração do banco concluída.")
+
 if __name__ == "__main__":
     init_db()
+    migrate_db()
