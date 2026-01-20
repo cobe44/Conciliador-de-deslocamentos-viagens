@@ -256,9 +256,10 @@ with tab_fechamento:
                     df_selected = df_desloc[df_desloc['id'].isin(selected_ids)]
                     data_inicio_viagem = df_selected['data_inicio'].min()
                     data_fim_viagem = df_selected['data_fim'].max()
-                    distancia_total = df_selected['distancia'].sum()
-                    tempo_total = df_selected['tempo'].sum() if 'tempo' in df_selected.columns else 0
-                    tempo_parado = df_selected['tempo_ocioso'].sum() if 'tempo_ocioso' in df_selected.columns else 0
+                    # Converter para float nativo Python (evita erro np.float64 no PostgreSQL)
+                    distancia_total = float(df_selected['distancia'].sum())
+                    tempo_total = float(df_selected['tempo'].sum()) if 'tempo' in df_selected.columns else 0.0
+                    tempo_parado = float(df_selected['tempo_ocioso'].sum()) if 'tempo_ocioso' in df_selected.columns else 0.0
                     
                     # Formatar tempos
                     def fmt_hhmm(mins):
@@ -375,15 +376,15 @@ with tab_fechamento:
                             """
                             params_ins = (
                                 placa_selecionada,
-                                data_inicio_viagem,
-                                data_fim_viagem,
-                                tempo_total,
-                                tempo_parado,
+                                str(data_inicio_viagem) if hasattr(data_inicio_viagem, 'isoformat') else data_inicio_viagem,
+                                str(data_fim_viagem) if hasattr(data_fim_viagem, 'isoformat') else data_fim_viagem,
+                                float(tempo_total),
+                                float(tempo_parado),
                                 operacao,
                                 rota,
                                 num_cte,
-                                valor,
-                                distancia_total,
+                                float(valor) if valor else 0.0,
+                                float(distancia_total),
                                 tipo_viagem,
                                 obs_final
                             )
@@ -418,8 +419,8 @@ with tab_fechamento:
                             
                             # Criar viagens individuais para cada deslocamento como improdutivo
                             for _, row in df_selected.iterrows():
-                                tempo_desloc = row.get('tempo', 0) if 'tempo' in row else 0
-                                tempo_parado_desloc = row.get('tempo_ocioso', 0) if 'tempo_ocioso' in row else 0
+                                tempo_desloc = float(row.get('tempo', 0)) if 'tempo' in row else 0.0
+                                tempo_parado_desloc = float(row.get('tempo_ocioso', 0)) if 'tempo_ocioso' in row else 0.0
                                 sql_imp = f"""
                                     INSERT INTO viagens 
                                     (placa, data_inicio, data_fim, tempo_total, tempo_parado, operacao, rota, num_cte, valor, distancia_total, tipo_viagem, observacao)
@@ -427,15 +428,15 @@ with tab_fechamento:
                                 """
                                 params_imp = (
                                     placa_selecionada,
-                                    row['data_inicio'],
-                                    row['data_fim'],
-                                    tempo_desloc,
-                                    tempo_parado_desloc,
+                                    str(row['data_inicio']) if hasattr(row['data_inicio'], 'isoformat') else row['data_inicio'],
+                                    str(row['data_fim']) if hasattr(row['data_fim'], 'isoformat') else row['data_fim'],
+                                    float(tempo_desloc),
+                                    float(tempo_parado_desloc),
                                     "Apoio",
                                     f"{row['local_inicio']} > {row['local_fim']}",
                                     "",
-                                    0,
-                                    row['distancia'],
+                                    0.0,
+                                    float(row['distancia']) if row['distancia'] else 0.0,
                                     "IMPRODUTIVA",
                                     observacao if observacao else "Marcado como improdutivo"
                                 )
