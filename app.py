@@ -7,7 +7,8 @@ import math
 import io
 import warnings
 from database import get_connection, get_placeholder, execute_insert_returning_id
-from poi_data import POIS_TATUI, POIS_PASSOS, POIS_IPIGUA, MAPA_CIDADES_PASSOS
+from poi_data import POIS_NUPORANGA
+import functools
 
 # Ignorar avisos
 warnings.filterwarnings("ignore")
@@ -15,17 +16,99 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Gestão de Frota", layout="wide")
 st.title("🚛 Gestão de Frota")
 
-# 2. Seleção de Veículo (Do Banco com Placa)
-conn = get_connection()
-# Query que traz o ID e a Placa (se existir)
-query_v = """
-    SELECT DISTINCT p.id_veiculo, v.placa 
-    FROM posicoes_raw p 
-    LEFT JOIN veiculos v ON p.id_veiculo = v.id_sascar
-    ORDER BY v.placa, p.id_veiculo
-"""
-veiculos_df = pd.read_sql(query_v, conn)
-conn.close()
+# Funções com cache para melhorar performance
+@st.cache_data(ttl=60)  # Cache por 60 segundos
+def get_veiculos():
+    """Busca lista de veículos com cache"""
+    conn = get_connection()
+    query_v = """
+        SELECT DISTINCT p.id_veiculo, v.placa 
+        FROM posicoes_raw p 
+        LEFT JOIN veiculos v ON p.id_veiculo = v.id_sascar
+        ORDER BY v.placa, p.id_veiculo
+    """
+    df = pd.read_sql(query_v, conn)
+    conn.close()
+    return df
+
+@st.cache_data(ttl=30)  # Cache por 30 segundos
+def get_deslocamentos_pendentes(placa):
+    """Busca deslocamentos pendentes com cache"""
+    conn = get_connection()
+    query = f"""
+        SELECT id, data_inicio, data_fim, km_inicial, km_final, distancia,
+               local_inicio, local_fim, tempo, tempo_ocioso, situacao
+        FROM deslocamentos 
+        WHERE placa = {get_placeholder(1)} AND status = 'PENDENTE'
+        ORDER BY data_inicio
+    """
+    df = pd.read_sql(query, conn, params=(placa,))
+    conn.close()
+    return df
+
+@st.cache_data(ttl=30)
+def get_placas_pendentes():
+    """Busca placas com deslocamentos pendentes com cache"""
+    conn = get_connection()
+    query = """
+        SELECT DISTINCT placa FROM deslocamentos 
+        WHERE status = 'PENDENTE' 
+        ORDER BY placa
+    """
+    try:
+        placas = pd.read_sql(query, conn)['placa'].tolist()
+    except:
+        placas = []
+    conn.close()
+    return placas
+
+@st.cache_data(ttl=60)
+def get_ultimas_posicoes():
+    """Busca últimas posições de todos os veículos com cache"""
+    conn = get_connection()
+    query = """
+        SELECT 
+            p.id_veiculo,
+            v.placa,
+            p.latitude,
+            p.longitude,
+            p.data_hora,
+            p.ignicao,
+            p.velocidade,
+            p.odometro
+        FROM posicoes_raw p
+        LEFT JOIN veiculos v ON p.id_veiculo = v.id_sascar
+        WHERE p.id_veiculo IN (
+            SELECT DISTINCT id_veiculo FROM posicoes_raw
+        )
+        AND p.data_hora = (
+            SELECT MAX(data_hora) 
+            FROM posicoes_raw 
+            WHERE id_veiculo = p.id_veiculo
+        )
+        ORDER BY v.placa, p.id_veiculo
+    """
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+@st.cache_data(ttl=30)
+def get_viagens_historico():
+    """Busca histórico de viagens com cache"""
+    conn = get_connection()
+    query = """
+        SELECT id, placa, data_inicio, data_fim, operacao, rota, num_cte, 
+               valor, distancia_total, tipo_viagem, observacao
+        FROM viagens 
+        ORDER BY data_inicio DESC
+        LIMIT 100
+    """
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+# Carregar veículos
+veiculos_df = get_veiculos()
 
 if veiculos_df.empty:
     st.error("Nenhum dado de GPS encontrado no banco de dados.")
@@ -56,32 +139,8 @@ tab_overview, tab_fechamento, tab_historico = st.tabs(["🗺️ Visão Geral da 
 with tab_overview:
     st.subheader("Última Posição de Todos os Veículos")
     
-    # Buscar última posição de cada veículo
-    conn = get_connection()
-    query_ultimas_posicoes = """
-        SELECT 
-            p.id_veiculo,
-            v.placa,
-            p.latitude,
-            p.longitude,
-            p.data_hora,
-            p.ignicao,
-            p.velocidade,
-            p.odometro
-        FROM posicoes_raw p
-        LEFT JOIN veiculos v ON p.id_veiculo = v.id_sascar
-        WHERE p.id_veiculo IN (
-            SELECT DISTINCT id_veiculo FROM posicoes_raw
-        )
-        AND p.data_hora = (
-            SELECT MAX(data_hora) 
-            FROM posicoes_raw 
-            WHERE id_veiculo = p.id_veiculo
-        )
-        ORDER BY v.placa, p.id_veiculo
-    """
-    df_ultimas = pd.read_sql(query_ultimas_posicoes, conn)
-    conn.close()
+    # Buscar última posição de cada veículo (com cache)
+    df_ultimas = get_ultimas_posicoes()
     
     if df_ultimas.empty:
         st.warning("Nenhuma posição GPS encontrada no banco de dados.")
@@ -155,18 +214,8 @@ with tab_fechamento:
     Selecione deslocamentos pendentes e agrupe-os em viagens, classificando conforme as regras de negócio.
     """)
     
-    # Buscar placas com deslocamentos pendentes
-    conn = get_connection()
-    query_placas = """
-        SELECT DISTINCT placa FROM deslocamentos 
-        WHERE status = 'PENDENTE' 
-        ORDER BY placa
-    """
-    try:
-        placas_pendentes = pd.read_sql(query_placas, conn)['placa'].tolist()
-    except:
-        placas_pendentes = []
-    conn.close()
+    # Buscar placas com deslocamentos pendentes (com cache)
+    placas_pendentes = get_placas_pendentes()
     
     if not placas_pendentes:
         st.info("✅ Não há deslocamentos pendentes para processar.")
@@ -191,17 +240,8 @@ with tab_fechamento:
         )
         
         if placa_selecionada:
-            # Buscar deslocamentos pendentes desta placa
-            conn = get_connection()
-            query_desloc = f"""
-                SELECT id, data_inicio, data_fim, km_inicial, km_final, distancia,
-                       local_inicio, local_fim, tempo, tempo_ocioso, situacao
-                FROM deslocamentos 
-                WHERE placa = {get_placeholder(1)} AND status = 'PENDENTE'
-                ORDER BY data_inicio
-            """
-            df_desloc = pd.read_sql(query_desloc, conn, params=(placa_selecionada,))
-            conn.close()
+            # Buscar deslocamentos pendentes desta placa (com cache)
+            df_desloc = get_deslocamentos_pendentes(placa_selecionada)
             
             if df_desloc.empty:
                 st.warning("Nenhum deslocamento pendente para esta placa.")
@@ -214,14 +254,25 @@ with tab_fechamento:
                 df_display['Data Fim'] = pd.to_datetime(df_display['data_fim']).dt.strftime('%d/%m/%Y %H:%M')
                 df_display['Distância'] = df_display['distancia'].apply(lambda x: f"{x:.1f} km" if x else "0 km")
                 
-                # Formatar tempo como HH:MM
+                # Calcular duração real a partir das datas (diferença entre data_fim e data_inicio)
+                def calc_duration(row):
+                    try:
+                        inicio = pd.to_datetime(row['data_inicio'])
+                        fim = pd.to_datetime(row['data_fim'])
+                        diff_minutes = (fim - inicio).total_seconds() / 60
+                        h, m = divmod(int(diff_minutes), 60)
+                        return f"{h:02d}:{m:02d}"
+                    except:
+                        return "00:00"
+                
+                # Formatar tempo ocioso como HH:MM
                 def format_minutes(mins):
                     if pd.isna(mins) or mins == 0:
                         return "00:00"
                     h, m = divmod(int(mins), 60)
                     return f"{h:02d}:{m:02d}"
                 
-                df_display['Tempo'] = df_display['tempo'].apply(format_minutes)
+                df_display['Tempo'] = df_desloc.apply(calc_duration, axis=1)
                 df_display['Parado'] = df_display['tempo_ocioso'].apply(format_minutes)
                 df_display['Situação'] = df_display['situacao'].apply(lambda x: '⏸ PARADO' if x == 'PARADO' else '▶ MOVIMENTO')
                 df_display['Selecionar'] = False
@@ -405,7 +456,9 @@ with tab_fechamento:
                             # Limpar lista de CTEs
                             if 'ctes' in st.session_state:
                                 del st.session_state.ctes
-                                
+                            
+                            # Limpar cache e recarregar
+                            st.cache_data.clear()
                             st.rerun()
                             
                         except Exception as e:
@@ -450,6 +503,8 @@ with tab_fechamento:
                             conn.close()
                             
                             st.success(f"⚠️ {len(selected_ids)} deslocamento(s) marcado(s) como improdutivo(s).")
+                            # Limpar cache e recarregar
+                            st.cache_data.clear()
                             st.rerun()
                             
                         except Exception as e:
@@ -494,6 +549,8 @@ with tab_historico:
                         c.execute(f"DELETE FROM viagens WHERE id = {ph_ex}", (v_id_del,))
                         conn.commit()
                         st.success(f"✅ Viagem {v_id_del} excluída! {qtd_liberada} deslocamentos voltaram para 'PENDENTE'.")
+                        # Limpar cache e recarregar
+                        st.cache_data.clear()
                         st.rerun()
                     except Exception as e:
                         st.error(f"Erro ao excluir: {e}")
@@ -502,18 +559,9 @@ with tab_historico:
     
     st.divider()
     
-    # Listagem
-    conn = get_connection()
-    query_viagens = """
-        SELECT id, placa, data_inicio, data_fim, operacao, rota, num_cte, 
-               valor, distancia_total, tipo_viagem, observacao
-        FROM viagens 
-        ORDER BY data_inicio DESC
-        LIMIT 100
-    """
+    # Listagem (com cache)
     try:
-        df_viagens = pd.read_sql(query_viagens, conn)
-        conn.close()
+        df_viagens = get_viagens_historico()
         
         if df_viagens.empty:
             st.info("Nenhuma viagem registrada ainda.")
@@ -534,10 +582,8 @@ with tab_historico:
             
             st.dataframe(
                 df_viagens[cols_viagens].style.apply(highlight_tipo, axis=1),
-                width=None, # stretch automatically
+                use_container_width=True,
                 hide_index=True
             )
     except Exception as e:
-        conn.close()
         st.error(f"Erro ao carregar histórico: {e}")
-
