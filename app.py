@@ -100,7 +100,7 @@ def get_viagens_historico():
     conn = get_connection()
     query = """
         SELECT id, placa, data_inicio, data_fim, operacao, rota, num_cte, 
-               valor, valor_km, distancia_total, tipo_viagem, observacao
+               valor, valor_km, distancia_total, tipo_viagem, observacao, tempo_parado
         FROM viagens 
         ORDER BY data_inicio DESC
         LIMIT 100
@@ -621,6 +621,13 @@ with tab_historico:
             df_viagens['R$/KM'] = df_viagens['valor_km'].apply(lambda x: f"R$ {x:.2f}" if x and x > 0 else "-")
             df_viagens['Distância'] = df_viagens['distancia_total'].apply(lambda x: f"{x:.1f} km" if x else "-")
             
+            def fmt_hhmm(mins):
+                if pd.isna(mins) or mins == 0: return "-"
+                h, m = divmod(int(mins), 60)
+                return f"{h:02d}:{m:02d}"
+            
+            df_viagens['Tempo Parado'] = df_viagens['tempo_parado'].apply(fmt_hhmm)
+            
             # Colorir por tipo
             def highlight_tipo(row):
                 if row['tipo_viagem'] == 'PRODUTIVA':
@@ -628,7 +635,7 @@ with tab_historico:
                 else:
                     return ['background-color: #f8d7da'] * len(row)
             
-            cols_viagens = ['id', 'placa', 'Data Início', 'Data Fim', 'operacao', 'rota', 'Distância', 'Valor', 'R$/KM', 'tipo_viagem', 'observacao']
+            cols_viagens = ['id', 'placa', 'Data Início', 'Data Fim', 'operacao', 'rota', 'Distância', 'Tempo Parado', 'Valor', 'R$/KM', 'tipo_viagem', 'observacao']
 
             st.dataframe(
                 df_viagens[cols_viagens].style.apply(highlight_tipo, axis=1),
