@@ -37,7 +37,7 @@ def get_deslocamentos_pendentes(placa):
     conn = get_connection()
     query = f"""
         SELECT id, data_inicio, data_fim, km_inicial, km_final, distancia,
-               local_inicio, local_fim, tempo, tempo_ocioso, situacao,
+               local_inicio, local_fim, tempo, tempo_ocioso, tempo_motor_off, situacao,
                COALESCE(tipo_parada, 'MOVIMENTO') as tipo_parada,
                COALESCE(qtd_pontos, 0) as qtd_pontos
         FROM deslocamentos 
@@ -100,7 +100,7 @@ def get_viagens_historico():
     conn = get_connection()
     query = """
         SELECT id, placa, data_inicio, data_fim, operacao, rota, num_cte, 
-               valor, valor_km, distancia_total, tipo_viagem, observacao, tempo_parado
+               valor, valor_km, distancia_total, tipo_viagem, observacao, tempo_parado, tempo_motor_off
         FROM viagens 
         ORDER BY data_inicio DESC
         LIMIT 100
@@ -275,7 +275,8 @@ with tab_fechamento:
                     return f"{h:02d}:{m:02d}"
                 
                 df_display['Tempo'] = df_desloc.apply(calc_duration, axis=1)
-                df_display['Parado'] = df_display['tempo_ocioso'].apply(format_minutes)
+                df_display['Parado (On)'] = df_display['tempo_ocioso'].apply(format_minutes)
+                df_display['Desligado'] = df_display['tempo_motor_off'].apply(format_minutes) if 'tempo_motor_off' in df_display.columns else "00:00"
                 df_display['Situação'] = df_display['situacao'].apply(lambda x: '⏸ PARADO' if x == 'PARADO' else '▶ MOVIMENTO')
                 
                 # Mapear tipo de parada para ícones
@@ -285,14 +286,15 @@ with tab_fechamento:
                 df_display['Selecionar'] = False
                 
                 # Data editor para seleção
-                cols_editor = ['Selecionar', 'Tipo', 'Data Início', 'Data Fim', 'Tempo', 'Parado', 'local_inicio', 'local_fim', 'Distância']
+                cols_editor = ['Selecionar', 'Tipo', 'Data Início', 'Data Fim', 'Tempo', 'Parado (On)', 'Desligado', 'local_inicio', 'local_fim', 'Distância']
                 df_edit = st.data_editor(
                     df_display[cols_editor],
                     column_config={
                         "Selecionar": st.column_config.CheckboxColumn("✓", default=False, width="small"),
                         "Situação": st.column_config.TextColumn("Situação", width="small"),
                         "Tempo": st.column_config.TextColumn("Duração", width="small"),
-                        "Parado": st.column_config.TextColumn("Motor Lig.", width="small"),
+                        "Parado (On)": st.column_config.TextColumn("Motor Lig.", width="small"),
+                        "Desligado": st.column_config.TextColumn("Motor Off", width="small"),
                         "local_inicio": st.column_config.TextColumn("Local Início", width="medium"),
                         "local_fim": st.column_config.TextColumn("Local Fim", width="medium"),
                     },
@@ -325,8 +327,13 @@ with tab_fechamento:
                         distancia_total = float(df_selected['distancia'].sum())
                         st.warning("⚠️ Distância calculada pela soma dos trechos (odômetro inválido)")
                     
-                    tempo_total = float(df_selected['tempo'].sum()) if 'tempo' in df_selected.columns else 0.0
+                    # Calcular tempo total como diferença entre fim e início (inclui gaps)
+                    inicio_dt = pd.to_datetime(data_inicio_viagem)
+                    fim_dt = pd.to_datetime(data_fim_viagem)
+                    tempo_total = (fim_dt - inicio_dt).total_seconds() / 60  # Em minutos
+                    
                     tempo_parado = float(df_selected['tempo_ocioso'].sum()) if 'tempo_ocioso' in df_selected.columns else 0.0
+                    tempo_off = float(df_selected['tempo_motor_off'].sum()) if 'tempo_motor_off' in df_selected.columns else 0.0
                     
                     # Formatar tempos
                     def fmt_hhmm(mins):
@@ -346,7 +353,8 @@ with tab_fechamento:
                     with col_res2:
                         st.metric("Tempo Total", fmt_hhmm(tempo_total))
                     with col_res3:
-                        st.metric("Motor Parado", fmt_hhmm(tempo_parado))
+                        st.metric("Motor Ligado (Parado)", fmt_hhmm(tempo_parado))
+                        st.caption(f"Desligado: {fmt_hhmm(tempo_off)}")
                     with col_res4:
                         st.metric("Distância", f"{distancia_total:.1f} km")
                     with col_res5:
@@ -470,7 +478,7 @@ with tab_fechamento:
                             ph_ins = get_placeholder(13)
                             sql_ins = f"""
                                 INSERT INTO viagens 
-                                (placa, data_inicio, data_fim, tempo_total, tempo_parado, operacao, rota, num_cte, valor, valor_km, distancia_total, tipo_viagem, observacao)
+                                (placa, data_inicio, data_fim, tempo_total, tempo_parado, tempo_motor_off, operacao, rota, num_cte, valor, valor_km, distancia_total, tipo_viagem, observacao)
                                 VALUES ({ph_ins})
                             """
                             params_ins = (
@@ -479,6 +487,7 @@ with tab_fechamento:
                                 str(data_fim_viagem) if hasattr(data_fim_viagem, 'isoformat') else data_fim_viagem,
                                 float(tempo_total),
                                 float(tempo_parado),
+                                float(tempo_off),
                                 operacao,
                                 rota,
                                 num_cte,
@@ -627,6 +636,7 @@ with tab_historico:
                 return f"{h:02d}:{m:02d}"
             
             df_viagens['Tempo Parado'] = df_viagens['tempo_parado'].apply(fmt_hhmm)
+            df_viagens['Motor Off'] = df_viagens['tempo_motor_off'].apply(fmt_hhmm) if 'tempo_motor_off' in df_viagens.columns else "-"
             
             # Colorir por tipo
             def highlight_tipo(row):
@@ -635,7 +645,7 @@ with tab_historico:
                 else:
                     return ['background-color: #f8d7da'] * len(row)
             
-            cols_viagens = ['id', 'placa', 'Data Início', 'Data Fim', 'operacao', 'rota', 'Distância', 'Tempo Parado', 'Valor', 'R$/KM', 'tipo_viagem', 'observacao']
+            cols_viagens = ['id', 'placa', 'Data Início', 'Data Fim', 'operacao', 'rota', 'Distância', 'Tempo Parado', 'Motor Off', 'Valor', 'R$/KM', 'tipo_viagem', 'observacao']
 
             st.dataframe(
                 df_viagens[cols_viagens].style.apply(highlight_tipo, axis=1),
