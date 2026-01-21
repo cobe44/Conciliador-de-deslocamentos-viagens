@@ -1,12 +1,3 @@
-"""
-Processador de Deslocamentos v3
-================================
-Versão melhorada com:
-- Processamento INCREMENTAL (sem DELETE destrutivo)
-- Cálculo de tempo ocioso real
-- Detecção de perda de sinal vs parada intencional
-- Rastreabilidade com raw_id_inicio e raw_id_fim
-"""
 
 import pandas as pd
 import numpy as np
@@ -20,15 +11,15 @@ from poi_data import POIS_NUPORANGA
 # ==========================================
 # CONFIGURAÇÕES
 # ==========================================
-GAP_THRESHOLD_MINUTES = 20      # Tempo de gap de sinal para considerar nova viagem
-STOP_THRESHOLD_KMH = 3          # Velocidade abaixo = parado (ociosidade)
-MIN_DISTANCIA_VIAGEM = 2        # Viagens < 2km são ruído/manobra
-SIGNAL_LOSS_THRESHOLD = 60      # > 60min sem sinal = provável perda de sinal
-MAX_SPEED_REALISTIC = 150       # Velocidade máxima realista (km/h)
+GAP_THRESHOLD_MINUTES = 20      
+STOP_THRESHOLD_KMH = 3        
+MIN_DISTANCIA_VIAGEM = 2        
+SIGNAL_LOSS_THRESHOLD = 60     
+MAX_SPEED_REALISTIC = 150      
 
-# V4: Novas configurações para lógica baseada em ignição + distância
-TEMPO_IGN_OFF_PARADA = 10       # Minutos com ignição OFF para FECHAR deslocamento
-DIST_REINICIO_DESLOCAMENTO = 3  # km de distância para REINICIAR deslocamento após parada
+
+TEMPO_IGN_OFF_PARADA = 10       
+DIST_REINICIO_DESLOCAMENTO = 3 
 
 # ==========================================
 # GEOCODIFICAÇÃO (mantida do original)
