@@ -1,3 +1,12 @@
+"""
+Processador de Deslocamentos v3
+================================
+Versão melhorada com:
+- Processamento INCREMENTAL (sem DELETE destrutivo)
+- Cálculo de tempo ocioso real
+- Detecção de perda de sinal vs parada intencional
+- Rastreabilidade com raw_id_inicio e raw_id_fim
+"""
 
 import pandas as pd
 import numpy as np
@@ -11,15 +20,15 @@ from poi_data import POIS_NUPORANGA
 # ==========================================
 # CONFIGURAÇÕES
 # ==========================================
-GAP_THRESHOLD_MINUTES = 20      
-STOP_THRESHOLD_KMH = 3        
-MIN_DISTANCIA_VIAGEM = 2        
-SIGNAL_LOSS_THRESHOLD = 60     
-MAX_SPEED_REALISTIC = 150      
+GAP_THRESHOLD_MINUTES = 20      # Tempo de gap de sinal para considerar nova viagem
+STOP_THRESHOLD_KMH = 3          # Velocidade abaixo = parado (ociosidade)
+MIN_DISTANCIA_VIAGEM = 2        # Viagens < 2km são ruído/manobra
+SIGNAL_LOSS_THRESHOLD = 60      # > 60min sem sinal = provável perda de sinal
+MAX_SPEED_REALISTIC = 150       # Velocidade máxima realista (km/h)
 
-
-TEMPO_IGN_OFF_PARADA = 10       
-DIST_REINICIO_DESLOCAMENTO = 3 
+# V4: Novas configurações para lógica baseada em ignição + distância
+TEMPO_IGN_OFF_PARADA = 10       # Minutos com ignição OFF para FECHAR deslocamento
+DIST_REINICIO_DESLOCAMENTO = 3  # km de distância para REINICIAR deslocamento após parada
 
 # ==========================================
 # GEOCODIFICAÇÃO (mantida do original)
@@ -486,20 +495,31 @@ def processar_deslocamentos(reprocessar_tudo=False):
         
         tempo_minutos = (data_fim - data_inicio).total_seconds() / 60
         
-        # Para paradas, o tempo de motor off é igual ao tempo total
-        tempo_motor_off = tempo_minutos
-        
         # Geocodificação (local da parada - início e fim são iguais ou próximos)
         local_inicio = get_cached_city_name(parada['lat_inicio'], parada['lon_inicio'])
         local_fim = get_cached_city_name(parada['lat_fim'], parada['lon_fim'])
         
-        # Buscar pontos para contar
+        # Buscar pontos para contar e calcular ociosidade
         df_parada = df[
             (df['placa'] == placa) & 
             (df['data_hora'] >= data_inicio) & 
             (df['data_hora'] <= data_fim)
         ]
         qtd_pontos = len(df_parada)
+        
+        # Calcular tempo ocioso real (motor ligado mas parado) e tempo motor off
+        df_parada_copy = df_parada.copy()
+        df_parada_copy['time_diff'] = df_parada_copy['data_hora'].diff().dt.total_seconds() / 60
+        
+        # Tempo ocioso = tempo com ignição ON e velocidade < 3 km/h (motor ligado, parado)
+        tempo_ocioso = calcular_tempo_ocioso(df_parada_copy[df_parada_copy['ignicao'] == 1])
+        
+        # Tempo motor off = tempo total - tempo com ignição ON
+        tempo_motor_off = calcular_tempo_motor_off(df_parada_copy)
+        
+        # Se não há dados suficientes, assume todo o tempo como motor off
+        if tempo_motor_off == 0 and tempo_ocioso == 0:
+            tempo_motor_off = tempo_minutos
         
         paradas_to_insert.append((
             placa,
@@ -511,8 +531,8 @@ def processar_deslocamentos(reprocessar_tudo=False):
             local_inicio,
             local_fim,
             float(tempo_minutos),
-            0.0,  # tempo_ocioso (não aplicável para paradas)
-            float(tempo_motor_off),
+            float(tempo_ocioso),  # tempo com motor ligado mas parado
+            float(tempo_motor_off),  # tempo com motor desligado
             'PARADA',  # situacao
             'PARADA',  # tipo_parada
             int(qtd_pontos),
@@ -523,7 +543,8 @@ def processar_deslocamentos(reprocessar_tudo=False):
         if (i + 1) % 10 == 0:
             print(f"  Processando parada {i+1}/{len(paradas)}: {placa} - {local_inicio}")
 
-    # 4. Inserir deslocamentos em Batch
+    # 4. Inserir deslocamentos em Batch (lotes menores para evitar timeout)
+    BATCH_SIZE = 50
     if trips_to_insert:
         ph_ins = get_placeholder(16)
         query_insert = f"""
@@ -533,13 +554,24 @@ def processar_deslocamentos(reprocessar_tudo=False):
              tipo_parada, qtd_pontos, raw_id_inicio, raw_id_fim, status)
             VALUES ({ph_ins}, 'PENDENTE')
         """
-        c.executemany(query_insert, trips_to_insert)
-        conn.commit()
+        # Inserir em lotes menores para evitar timeout
+        for i in range(0, len(trips_to_insert), BATCH_SIZE):
+            batch = trips_to_insert[i:i + BATCH_SIZE]
+            try:
+                c.executemany(query_insert, batch)
+                conn.commit()
+            except Exception as e:
+                print(f"⚠️ Erro no lote {i//BATCH_SIZE + 1}: {e}")
+                # Reconectar e tentar novamente
+                conn = get_connection()
+                c = conn.cursor()
+                c.executemany(query_insert, batch)
+                conn.commit()
         print(f"✅ Sucesso: {len(trips_to_insert)} deslocamentos NOVOS inseridos no banco.")
     else:
         print("ℹ️ Nenhum deslocamento novo para inserir.")
     
-    # 4.1 Inserir paradas em Batch
+    # 4.1 Inserir paradas em Batch (lotes menores para evitar timeout)
     if paradas_to_insert:
         ph_ins = get_placeholder(16)
         query_insert = f"""
@@ -549,8 +581,19 @@ def processar_deslocamentos(reprocessar_tudo=False):
              tipo_parada, qtd_pontos, raw_id_inicio, raw_id_fim, status)
             VALUES ({ph_ins}, 'PENDENTE')
         """
-        c.executemany(query_insert, paradas_to_insert)
-        conn.commit()
+        # Inserir em lotes menores para evitar timeout
+        for i in range(0, len(paradas_to_insert), BATCH_SIZE):
+            batch = paradas_to_insert[i:i + BATCH_SIZE]
+            try:
+                c.executemany(query_insert, batch)
+                conn.commit()
+            except Exception as e:
+                print(f"⚠️ Erro no lote de paradas {i//BATCH_SIZE + 1}: {e}")
+                # Reconectar e tentar novamente
+                conn = get_connection()
+                c = conn.cursor()
+                c.executemany(query_insert, batch)
+                conn.commit()
         print(f"✅ Sucesso: {len(paradas_to_insert)} paradas NOVAS inseridas no banco.")
     else:
         print("ℹ️ Nenhuma parada nova para inserir.")
