@@ -475,7 +475,7 @@ with tab_fechamento:
                             valor_km_final = valor_final / distancia_total if distancia_total > 0 else 0.0
 
                             # Inserir viagem
-                            ph_ins = get_placeholder(13)
+                            ph_ins = get_placeholder(14)
                             sql_ins = f"""
                                 INSERT INTO viagens 
                                 (placa, data_inicio, data_fim, tempo_total, tempo_parado, tempo_motor_off, operacao, rota, num_cte, valor, valor_km, distancia_total, tipo_viagem, observacao)
