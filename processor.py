@@ -20,11 +20,15 @@ from poi_data import POIS_NUPORANGA
 # ==========================================
 # CONFIGURAÇÕES
 # ==========================================
-GAP_THRESHOLD_MINUTES = 20      # Tempo de gap para considerar nova viagem
-STOP_THRESHOLD_KMH = 3          # Velocidade abaixo = parado
-MIN_DISTANCIA_VIAGEM = 2     # Viagens < 0.5km são ruído/manobra
-SIGNAL_LOSS_THRESHOLD = 60      # > 60min sem sinal com ignição = provável perda de sinal
-MAX_SPEED_REALISTIC = 150       # Velocidade máxima realista (km/h) - acima é erro de GPS
+GAP_THRESHOLD_MINUTES = 20      # Tempo de gap de sinal para considerar nova viagem
+STOP_THRESHOLD_KMH = 3          # Velocidade abaixo = parado (ociosidade)
+MIN_DISTANCIA_VIAGEM = 2        # Viagens < 2km são ruído/manobra
+SIGNAL_LOSS_THRESHOLD = 60      # > 60min sem sinal = provável perda de sinal
+MAX_SPEED_REALISTIC = 150       # Velocidade máxima realista (km/h)
+
+# V4: Novas configurações para lógica baseada em ignição + distância
+TEMPO_IGN_OFF_PARADA = 10       # Minutos com ignição OFF para FECHAR deslocamento
+DIST_REINICIO_DESLOCAMENTO = 3  # km de distância para REINICIAR deslocamento após parada
 
 # ==========================================
 # GEOCODIFICAÇÃO (mantida do original)
@@ -163,6 +167,160 @@ def calcular_tempo_motor_off(trip_df):
     return pontos_off['time_diff'].sum()
 
 
+def classificar_deslocamentos_v4(df):
+    """
+    Classificador V4 - Lógica baseada em ignição + distância
+    
+    Regras:
+    - DESLOCAMENTO: ignição=1 constante, TERMINA quando ignição=0 por 10+ min
+    - PARADA: inicia no primeiro ignição=0, TERMINA quando ignição=1 E dist>=3km
+    - OCIOSIDADE: ignição=1 mas parado - NÃO inicia novo deslocamento
+    
+    Args:
+        df: DataFrame com colunas [raw_id, placa, data_hora, ignicao, velocidade, odometro, lat, lon]
+    
+    Returns:
+        Lista de dicionários com os períodos classificados
+    """
+    resultados = []
+    
+    # Processar por placa
+    for placa in df['placa'].unique():
+        df_placa = df[df['placa'] == placa].sort_values('data_hora').reset_index(drop=True)
+        
+        if df_placa.empty:
+            continue
+        
+        # Calcular diferença de tempo entre posições
+        df_placa['time_diff'] = df_placa['data_hora'].diff().dt.total_seconds() / 60
+        
+        estado = None  # 'DESLOCAMENTO' ou 'PARADA'
+        inicio_idx = 0
+        odo_inicio_parada = None
+        tempo_ign_off_acumulado = 0
+        
+        for idx, row in df_placa.iterrows():
+            ignicao = row['ignicao'] or 0
+            velocidade = row['velocidade'] or 0
+            time_diff = row['time_diff'] if pd.notna(row['time_diff']) else 0
+            odometro = row['odometro'] or 0
+            
+            if estado is None:
+                # Primeiro ponto
+                if ignicao == 1:
+                    estado = 'DESLOCAMENTO'
+                    inicio_idx = idx
+                    tempo_ign_off_acumulado = 0
+                else:
+                    estado = 'PARADA'
+                    inicio_idx = idx
+                    odo_inicio_parada = odometro
+                    
+            elif estado == 'DESLOCAMENTO':
+                if ignicao == 0:
+                    tempo_ign_off_acumulado += time_diff
+                    if tempo_ign_off_acumulado >= TEMPO_IGN_OFF_PARADA:
+                        # Fecha deslocamento - buscar último ponto com ignição=1
+                        fim_deslocamento_idx = idx
+                        for back_idx in range(idx, inicio_idx, -1):
+                            if df_placa.loc[back_idx, 'ignicao'] == 1:
+                                fim_deslocamento_idx = back_idx
+                                break
+                        
+                        resultados.append({
+                            'placa': placa,
+                            'tipo': 'DESLOCAMENTO',
+                            'inicio_idx': inicio_idx,
+                            'fim_idx': fim_deslocamento_idx,
+                            'data_inicio': df_placa.loc[inicio_idx, 'data_hora'],
+                            'data_fim': df_placa.loc[fim_deslocamento_idx, 'data_hora'],
+                            'odo_inicio': df_placa.loc[inicio_idx, 'odometro'],
+                            'odo_fim': df_placa.loc[fim_deslocamento_idx, 'odometro'],
+                            'raw_id_inicio': df_placa.loc[inicio_idx, 'raw_id'],
+                            'raw_id_fim': df_placa.loc[fim_deslocamento_idx, 'raw_id'],
+                            'lat_inicio': df_placa.loc[inicio_idx, 'latitude'],
+                            'lon_inicio': df_placa.loc[inicio_idx, 'longitude'],
+                            'lat_fim': df_placa.loc[fim_deslocamento_idx, 'latitude'],
+                            'lon_fim': df_placa.loc[fim_deslocamento_idx, 'longitude'],
+                        })
+                        
+                        # Inicia parada
+                        estado = 'PARADA'
+                        for p_idx in range(fim_deslocamento_idx + 1, idx + 1):
+                            if df_placa.loc[p_idx, 'ignicao'] == 0:
+                                inicio_idx = p_idx
+                                break
+                        else:
+                            inicio_idx = idx
+                        
+                        odo_inicio_parada = df_placa.loc[inicio_idx, 'odometro']
+                        tempo_ign_off_acumulado = 0
+                else:
+                    # ignição=1, continua deslocamento
+                    tempo_ign_off_acumulado = 0
+                        
+            elif estado == 'PARADA':
+                if ignicao == 1:
+                    dist_desde_parada = abs(odometro - odo_inicio_parada) if odo_inicio_parada else 0
+                    if dist_desde_parada >= DIST_REINICIO_DESLOCAMENTO:
+                        # Fecha parada - buscar último ponto com ignição=0
+                        fim_parada_idx = idx
+                        for back_idx in range(idx, inicio_idx, -1):
+                            if df_placa.loc[back_idx, 'ignicao'] == 0:
+                                fim_parada_idx = back_idx
+                                break
+                        
+                        resultados.append({
+                            'placa': placa,
+                            'tipo': 'PARADA',
+                            'inicio_idx': inicio_idx,
+                            'fim_idx': fim_parada_idx,
+                            'data_inicio': df_placa.loc[inicio_idx, 'data_hora'],
+                            'data_fim': df_placa.loc[fim_parada_idx, 'data_hora'],
+                            'odo_inicio': df_placa.loc[inicio_idx, 'odometro'],
+                            'odo_fim': df_placa.loc[fim_parada_idx, 'odometro'],
+                            'raw_id_inicio': df_placa.loc[inicio_idx, 'raw_id'],
+                            'raw_id_fim': df_placa.loc[fim_parada_idx, 'raw_id'],
+                            'lat_inicio': df_placa.loc[inicio_idx, 'latitude'],
+                            'lon_inicio': df_placa.loc[inicio_idx, 'longitude'],
+                            'lat_fim': df_placa.loc[fim_parada_idx, 'latitude'],
+                            'lon_fim': df_placa.loc[fim_parada_idx, 'longitude'],
+                        })
+                        
+                        # Inicia novo deslocamento
+                        estado = 'DESLOCAMENTO'
+                        for d_idx in range(fim_parada_idx + 1, idx + 1):
+                            if df_placa.loc[d_idx, 'ignicao'] == 1:
+                                inicio_idx = d_idx
+                                break
+                        else:
+                            inicio_idx = idx
+                        
+                        tempo_ign_off_acumulado = 0
+                    # Se dist < 3km, continua na parada (ociosidade)
+        
+        # Fechar último período
+        if estado is not None and len(df_placa) > 0:
+            last_idx = len(df_placa) - 1
+            resultados.append({
+                'placa': placa,
+                'tipo': estado,
+                'inicio_idx': inicio_idx,
+                'fim_idx': last_idx,
+                'data_inicio': df_placa.loc[inicio_idx, 'data_hora'],
+                'data_fim': df_placa.iloc[-1]['data_hora'],
+                'odo_inicio': df_placa.loc[inicio_idx, 'odometro'],
+                'odo_fim': df_placa.iloc[-1]['odometro'],
+                'raw_id_inicio': df_placa.loc[inicio_idx, 'raw_id'],
+                'raw_id_fim': df_placa.iloc[-1]['raw_id'],
+                'lat_inicio': df_placa.loc[inicio_idx, 'latitude'],
+                'lon_inicio': df_placa.loc[inicio_idx, 'longitude'],
+                'lat_fim': df_placa.iloc[-1]['latitude'],
+                'lon_fim': df_placa.iloc[-1]['longitude'],
+            })
+    
+    return resultados
+
 def obter_ultimo_raw_id_processado():
     """
     Busca o maior raw_id_fim já processado.
@@ -186,13 +344,18 @@ def obter_ultimo_raw_id_processado():
 
 def processar_deslocamentos(reprocessar_tudo=False):
     """
-    Processador V3 - Incremental e Preciso
+    Processador V4 - Baseado em Ignição + Distância
+    
+    Lógica:
+    - DESLOCAMENTO: ignição=1, termina quando ignição=0 por 10+ min
+    - PARADA: inicia com ignição=0, termina quando ignição=1 E dist>=3km
+    - OCIOSIDADE: ignição=1 mas parado - não inicia novo deslocamento
     
     Args:
         reprocessar_tudo: Se True, ignora processamento incremental e reprocessa tudo.
                          CUIDADO: Isso pode criar duplicatas se não limpar antes!
     """
-    print("🚀 Iniciando Processador V3 (Incremental)...")
+    print("🚀 Iniciando Processador V4 (Ignição + Distância)...")
     
     # Garantir que as novas colunas existam
     try:
@@ -240,187 +403,86 @@ def processar_deslocamentos(reprocessar_tudo=False):
     # Converter data
     df['data_hora'] = pd.to_datetime(df['data_hora'])
     
-    # 2. Calcular diferenças de tempo entre posições consecutivas
-    df['time_diff'] = df.groupby('placa')['data_hora'].diff().dt.total_seconds() / 60
+    # 2. Usar nova classificação V4 baseada em máquina de estados
+    print("🔄 Classificando períodos com lógica V4...")
+    periodos = classificar_deslocamentos_v4(df)
     
-    # Calcular velocidade média dos últimos N pontos (para classificar gaps)
-    df['velocidade_media'] = df.groupby('placa')['velocidade'].transform(
-        lambda x: x.rolling(window=3, min_periods=1).mean().shift(1)
-    )
+    print(f"📊 Períodos identificados: {len(periodos)}")
     
-    # ========================================================================
-    # LÓGICA CORRETA DE DESLOCAMENTO:
-    # - Deslocamento CONTINUA enquanto ignição está LIGADA (mesmo parado)
-    # - Deslocamento SÓ TERMINA quando TEMPO ACUMULADO com ignição OFF >= 10 min
-    # - Gap de sinal > 20 min também finaliza (pode ter desligado)
-    # ========================================================================
+    # Separar apenas deslocamentos (ON) para inserir no banco
+    deslocamentos = [p for p in periodos if p['tipo'] == 'DESLOCAMENTO']
+    paradas = [p for p in periodos if p['tipo'] == 'PARADA']
     
-    TEMPO_MIN_PARADA_MINUTOS = 10  # Tempo mínimo ACUMULADO com ignição 0 para finalizar viagem
+    print(f"   - Deslocamentos (ON): {len(deslocamentos)}")
+    print(f"   - Paradas (OFF): {len(paradas)}")
     
-    # Calcular TEMPO ACUMULADO com ignição desligada por veículo
-    # Se ignição=0, acumula o time_diff. Se ignição=1, reseta para 0.
-    def calcular_tempo_acumulado_off(group):
-        tempo_off_acumulado = []
-        acumulado = 0
-        
-        for idx, row in group.iterrows():
-            if row['ignicao'] == 0:
-                # Ignição desligada - acumula o tempo
-                acumulado += row['time_diff'] if pd.notna(row['time_diff']) else 0
-            else:
-                # Ignição ligada - reseta mas primeiro guarda o valor acumulado
-                pass
-            
-            tempo_off_acumulado.append(acumulado)
-            
-            # Se ignição ligou, reseta o acumulador DEPOIS de guardar
-            if row['ignicao'] == 1:
-                acumulado = 0
-        
-        return pd.Series(tempo_off_acumulado, index=group.index)
-    
-    df['tempo_off_acumulado'] = df.groupby('placa', group_keys=False).apply(calcular_tempo_acumulado_off)
-    
-    df['last_ignicao'] = df.groupby('placa')['ignicao'].shift(1)
-    df['last_tempo_off'] = df.groupby('placa')['tempo_off_acumulado'].shift(1)
-    
-    # Identificar quando ignição LIGA (0→1) após período desligado
-    df['ignicao_ligou'] = (df['last_ignicao'] == 0) & (df['ignicao'] == 1)
-    
-    # Um NOVO DESLOCAMENTO começa quando:
-    # 1. Primeiro registro do veículo (sem dados anteriores)
-    # 2. Ignição LIGA E tempo acumulado com ignição OFF foi >= 10 min
-    # 3. Gap de sinal > 20 min (assumimos que desligou e religou)
-    
-    df['parada_prolongada'] = (
-        (df['ignicao_ligou']) &           # Ignição acabou de ligar
-        (df['last_tempo_off'] >= TEMPO_MIN_PARADA_MINUTOS)  # Ficou desligada 10+ min ACUMULADOS
-    )
-    
-    # Também nova viagem se gap muito longo (perda de sinal)
-    df['gap_longo'] = df['time_diff'] > GAP_THRESHOLD_MINUTES
-    
-    # Uma nova viagem começa quando:
-    df['new_trip'] = (
-        df['time_diff'].isna() |      # Primeiro registro do veículo
-        df['parada_prolongada'] |      # Ignição ficou desligada 10+ min ACUMULADOS e religou
-        df['gap_longo']                # Gap de sinal > 20 min
-    )
-    
-    # Classificar tipo de parada (para exibição)
-    df['tipo_gap'] = df.apply(
-        lambda row: classificar_tipo_parada(
-            row['time_diff'] if pd.notna(row['time_diff']) else 0,
-            row['last_ignicao'] if pd.notna(row['last_ignicao']) else 1,
-            row['velocidade_media']
-        ),
-        axis=1
-    )
-    
-    # Criar ID único de viagem
-    df['trip_id'] = df['new_trip'].cumsum()
-    
-    viagens_brutas = df['trip_id'].max()
-    print(f"📊 Viagens brutas identificadas: {viagens_brutas}")
-    
-    # 3. Agregar dados por viagem
-    stats = df.groupby('trip_id').agg(
-        placa=('placa', 'first'),
-        data_inicio=('data_hora', 'min'),
-        data_fim=('data_hora', 'max'),
-        km_inicial=('odometro', 'first'),  # Primeiro odômetro (não mínimo - pode haver reset)
-        km_final=('odometro', 'last'),      # Último odômetro
-        lat_inicio=('latitude', 'first'),
-        lon_inicio=('longitude', 'first'),
-        lat_fim=('latitude', 'last'),
-        lon_fim=('longitude', 'last'),
-        qtd_pontos=('raw_id', 'count'),
-        raw_id_inicio=('raw_id', 'min'),
-        raw_id_fim=('raw_id', 'max'),
-        tipo_parada=('tipo_gap', 'first'),  # Tipo do primeiro ponto da viagem
-        ignicao_media=('ignicao', 'mean'),  # Para determinar se estava mais ligado ou desligado
-    ).reset_index()
-    
-    print("⏱️ Calculando tempo ocioso e motor off por viagem...")
-    tempos_ociosos = []
-    tempos_motor_off = []
-    
-    for trip_id in stats['trip_id']:
-        trip_df = df[df['trip_id'] == trip_id]
-        
-        # Tempo Ocioso (Motor Ligado + Vel 0)
-        # Ajuste: Ociosidade deve considerar apenas ignicao=1?
-        # A definição original era velocity < threshold.
-        # Vamos refinar: Ocioso = Vel < limit E Ignicao = 1
-        trip_df_ocioso = trip_df[trip_df['ignicao'] == 1]
-        t_ocioso = calcular_tempo_ocioso(trip_df_ocioso)
-        tempos_ociosos.append(t_ocioso)
-        
-        # Tempo Motor Off
-        t_off = calcular_tempo_motor_off(trip_df)
-        tempos_motor_off.append(t_off)
-        
-    stats['tempo_ocioso'] = tempos_ociosos
-    stats['tempo_motor_off'] = tempos_motor_off
-    
-    # Calcular métricas derivadas
-    stats['distancia'] = stats['km_final'] - stats['km_inicial']
-    stats['tempo_minutos'] = (stats['data_fim'] - stats['data_inicio']).dt.total_seconds() / 60
-    
-    # Determinar situação baseada na ignição média
-    stats['situacao'] = stats['ignicao_media'].apply(
-        lambda x: 'MOVIMENTO' if x > 0.5 else 'PARADO'
-    )
-    
-    # 5. Validar e filtrar viagens
-    # Filtrar distâncias inválidas (negativas ou muito pequenas = manobra)
-    stats_validas = stats[
-        (stats['distancia'] >= MIN_DISTANCIA_VIAGEM) & 
-        (stats['distancia'] < 2000)  # Max 2000km em uma viagem (sanity check)
-    ].copy()
-    
-    # Viagens com distância negativa = reset de odômetro, marcar diferente
-    stats_reset = stats[stats['distancia'] < 0].copy()
-    if len(stats_reset) > 0:
-        print(f"⚠️ {len(stats_reset)} viagens com possível reset de odômetro (distância negativa)")
-        stats_reset['distancia'] = 0
-        stats_reset['tipo_parada'] = 'RESET_ODOMETRO'
-        # Incluir mesmo assim para não perder rastreabilidade
-        stats_validas = pd.concat([stats_validas, stats_reset], ignore_index=True)
-    
-    print(f"✨ Viagens válidas após filtro: {len(stats_validas)}")
-    
-    # 6. Geocodificação e Inserção
-    c = conn.cursor()
+    # 3. Calcular métricas adicionais para cada deslocamento
+    print("⏱️ Calculando métricas por deslocamento...")
     trips_to_insert = []
+    c = conn.cursor()
     
-    for idx, row in stats_validas.iterrows():
-        local_inicio = get_cached_city_name(row['lat_inicio'], row['lon_inicio'])
-        local_fim = get_cached_city_name(row['lat_fim'], row['lon_fim'])
+    for i, desloc in enumerate(deslocamentos):
+        placa = desloc['placa']
+        data_inicio = desloc['data_inicio']
+        data_fim = desloc['data_fim']
+        odo_inicio = desloc['odo_inicio'] or 0
+        odo_fim = desloc['odo_fim'] or 0
+        distancia = abs(odo_fim - odo_inicio)
+        
+        # Filtrar viagens muito curtas (ruído)
+        if distancia < MIN_DISTANCIA_VIAGEM:
+            continue
+        
+        # Filtrar viagens impossíveis (>2000km)
+        if distancia > 2000:
+            continue
+        
+        tempo_minutos = (data_fim - data_inicio).total_seconds() / 60
+        
+        # Buscar pontos do deslocamento para calcular ociosidade
+        df_desloc = df[
+            (df['placa'] == placa) & 
+            (df['data_hora'] >= data_inicio) & 
+            (df['data_hora'] <= data_fim)
+        ]
+        
+        # Calcular tempo ocioso (velocidade < 3 km/h com ignição on)
+        df_desloc_copy = df_desloc.copy()
+        df_desloc_copy['time_diff'] = df_desloc_copy['data_hora'].diff().dt.total_seconds() / 60
+        tempo_ocioso = calcular_tempo_ocioso(df_desloc_copy[df_desloc_copy['ignicao'] == 1])
+        
+        # Calcular tempo motor off
+        tempo_motor_off = calcular_tempo_motor_off(df_desloc_copy)
+        
+        # Geocodificação
+        local_inicio = get_cached_city_name(desloc['lat_inicio'], desloc['lon_inicio'])
+        local_fim = get_cached_city_name(desloc['lat_fim'], desloc['lon_fim'])
+        
+        qtd_pontos = len(df_desloc)
         
         trips_to_insert.append((
-            row['placa'],
-            row['data_inicio'].strftime('%Y-%m-%d %H:%M:%S'),
-            row['data_fim'].strftime('%Y-%m-%d %H:%M:%S'),
-            float(row['km_inicial']),
-            float(row['km_final']),
-            float(row['distancia']),
+            placa,
+            data_inicio.strftime('%Y-%m-%d %H:%M:%S'),
+            data_fim.strftime('%Y-%m-%d %H:%M:%S'),
+            float(odo_inicio),
+            float(odo_fim),
+            float(distancia),
             local_inicio,
             local_fim,
-            float(row['tempo_minutos']),
-            float(row['tempo_ocioso']),
-            float(row['tempo_motor_off']),
-            row['situacao'],
-            row['tipo_parada'],
-            int(row['qtd_pontos']),
-            int(row['raw_id_inicio']),
-            int(row['raw_id_fim']),
+            float(tempo_minutos),
+            float(tempo_ocioso),
+            float(tempo_motor_off),
+            'MOVIMENTO',  # situacao
+            'MOVIMENTO',  # tipo_parada
+            int(qtd_pontos),
+            int(desloc['raw_id_inicio']),
+            int(desloc['raw_id_fim']),
         ))
         
-        if idx % 20 == 0:
-            print(f"  Processando {idx}/{len(stats_validas)}: {row['placa']} - {local_inicio} -> {local_fim}")
+        if (i + 1) % 10 == 0:
+            print(f"  Processando {i+1}/{len(deslocamentos)}: {placa} - {local_inicio} -> {local_fim}")
 
-    # 7. Inserir em Batch (sem DELETE prévio!)
+    # 4. Inserir em Batch
     if trips_to_insert:
         ph_ins = get_placeholder(16)
         query_insert = f"""
@@ -432,21 +494,22 @@ def processar_deslocamentos(reprocessar_tudo=False):
         """
         c.executemany(query_insert, trips_to_insert)
         conn.commit()
-        print(f"✅ Sucesso: {len(trips_to_insert)} viagens NOVAS inseridas no banco.")
+        print(f"✅ Sucesso: {len(trips_to_insert)} deslocamentos NOVOS inseridos no banco.")
     else:
-        print("ℹ️ Nenhuma viagem nova para inserir.")
+        print("ℹ️ Nenhum deslocamento novo para inserir.")
     
     conn.close()
     
     # Resumo final
     print("\n" + "="*50)
-    print("📊 RESUMO DO PROCESSAMENTO")
+    print("📊 RESUMO DO PROCESSAMENTO V4")
     print("="*50)
     print(f"  Posições processadas: {len(df)}")
-    print(f"  Viagens geradas: {len(trips_to_insert)}")
-    if len(stats_validas) > 0:
-        print(f"  Tipos de parada:")
-        print(stats_validas['tipo_parada'].value_counts().to_string())
+    print(f"  Períodos identificados: {len(periodos)}")
+    print(f"  Deslocamentos inseridos: {len(trips_to_insert)}")
+    print(f"  Paradas detectadas: {len(paradas)}")
+
+
 
 
 def limpar_e_reprocessar():
