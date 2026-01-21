@@ -15,7 +15,7 @@ from functools import lru_cache
 from database import get_connection, get_placeholder, get_pois, migrate_db
 
 # Usar apenas a base
-from poi_data import POIS_NUPORANGA
+from poi_data import POIS_NUPORANGA, POI_RADIUS
 
 # ==========================================
 # CONFIGURAÇÕES
@@ -76,7 +76,7 @@ def get_cached_city_name(lat, lon):
     # 1. Tentar Base Nuporanga (POIs locais)
     for name, coords_list in POIS_NUPORANGA.items():
         for (p_lat, p_lon) in coords_list:
-            if abs(lat_r - p_lat) < 0.01 and abs(lon_r - p_lon) < 0.01:
+            if abs(lat_r - p_lat) < POI_RADIUS and abs(lon_r - p_lon) < POI_RADIUS:
                 return name
 
     # 2. OpenStreetMap / Nominatim
