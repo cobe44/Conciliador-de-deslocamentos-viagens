@@ -118,6 +118,7 @@ def init_db():
             data_fim {TYPE_DATETIME},
             tempo_total REAL DEFAULT 0,
             tempo_parado REAL DEFAULT 0,
+            tempo_motor_off REAL DEFAULT 0,
             operacao TEXT,
             rota TEXT,
             num_cte TEXT,
@@ -142,6 +143,7 @@ def init_db():
             local_fim TEXT,
             tempo REAL DEFAULT 0,
             tempo_ocioso REAL DEFAULT 0,
+            tempo_motor_off REAL DEFAULT 0,
             situacao TEXT DEFAULT 'MOVIMENTO',
             tipo_parada TEXT DEFAULT 'MOVIMENTO',
             qtd_pontos INTEGER DEFAULT 0,
@@ -256,6 +258,7 @@ def migrate_db():
         ("qtd_pontos", "INTEGER DEFAULT 0"),
         ("raw_id_inicio", "INTEGER"),
         ("raw_id_fim", "INTEGER"),
+        ("tempo_motor_off", "REAL DEFAULT 0"),
     ]
     
     for col_name, col_def in migrations:
