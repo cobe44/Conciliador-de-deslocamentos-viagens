@@ -22,7 +22,7 @@ from poi_data import POIS_NUPORANGA
 # ==========================================
 GAP_THRESHOLD_MINUTES = 20      # Tempo de gap para considerar nova viagem
 STOP_THRESHOLD_KMH = 3          # Velocidade abaixo = parado
-MIN_DISTANCIA_VIAGEM = 0.5      # Viagens < 0.5km são ruído/manobra
+MIN_DISTANCIA_VIAGEM = 2     # Viagens < 0.5km são ruído/manobra
 SIGNAL_LOSS_THRESHOLD = 60      # > 60min sem sinal com ignição = provável perda de sinal
 MAX_SPEED_REALISTIC = 150       # Velocidade máxima realista (km/h) - acima é erro de GPS
 
@@ -224,7 +224,7 @@ def processar_deslocamentos(reprocessar_tudo=False):
     # Converter data
     df['data_hora'] = pd.to_datetime(df['data_hora'])
     
-    # 2. Calcular diferenças de tempo e identificar viagens
+    # 2. Calcular diferenças de tempo entre posições consecutivas
     df['time_diff'] = df.groupby('placa')['data_hora'].diff().dt.total_seconds() / 60
     
     # Calcular velocidade média dos últimos N pontos (para classificar gaps)
@@ -232,11 +232,66 @@ def processar_deslocamentos(reprocessar_tudo=False):
         lambda x: x.rolling(window=3, min_periods=1).mean().shift(1)
     )
     
-    # Nova viagem se gap > limiar OU mudou de veículo
-    df['new_trip'] = (df['time_diff'] > GAP_THRESHOLD_MINUTES) | (df['time_diff'].isna())
+    # ========================================================================
+    # LÓGICA CORRETA DE DESLOCAMENTO:
+    # - Deslocamento CONTINUA enquanto ignição está LIGADA (mesmo parado)
+    # - Deslocamento SÓ TERMINA quando TEMPO ACUMULADO com ignição OFF >= 10 min
+    # - Gap de sinal > 20 min também finaliza (pode ter desligado)
+    # ========================================================================
     
-    # Classificar tipo de parada antes do gap
+    TEMPO_MIN_PARADA_MINUTOS = 10  # Tempo mínimo ACUMULADO com ignição 0 para finalizar viagem
+    
+    # Calcular TEMPO ACUMULADO com ignição desligada por veículo
+    # Se ignição=0, acumula o time_diff. Se ignição=1, reseta para 0.
+    def calcular_tempo_acumulado_off(group):
+        tempo_off_acumulado = []
+        acumulado = 0
+        
+        for idx, row in group.iterrows():
+            if row['ignicao'] == 0:
+                # Ignição desligada - acumula o tempo
+                acumulado += row['time_diff'] if pd.notna(row['time_diff']) else 0
+            else:
+                # Ignição ligada - reseta mas primeiro guarda o valor acumulado
+                pass
+            
+            tempo_off_acumulado.append(acumulado)
+            
+            # Se ignição ligou, reseta o acumulador DEPOIS de guardar
+            if row['ignicao'] == 1:
+                acumulado = 0
+        
+        return pd.Series(tempo_off_acumulado, index=group.index)
+    
+    df['tempo_off_acumulado'] = df.groupby('placa', group_keys=False).apply(calcular_tempo_acumulado_off)
+    
     df['last_ignicao'] = df.groupby('placa')['ignicao'].shift(1)
+    df['last_tempo_off'] = df.groupby('placa')['tempo_off_acumulado'].shift(1)
+    
+    # Identificar quando ignição LIGA (0→1) após período desligado
+    df['ignicao_ligou'] = (df['last_ignicao'] == 0) & (df['ignicao'] == 1)
+    
+    # Um NOVO DESLOCAMENTO começa quando:
+    # 1. Primeiro registro do veículo (sem dados anteriores)
+    # 2. Ignição LIGA E tempo acumulado com ignição OFF foi >= 10 min
+    # 3. Gap de sinal > 20 min (assumimos que desligou e religou)
+    
+    df['parada_prolongada'] = (
+        (df['ignicao_ligou']) &           # Ignição acabou de ligar
+        (df['last_tempo_off'] >= TEMPO_MIN_PARADA_MINUTOS)  # Ficou desligada 10+ min ACUMULADOS
+    )
+    
+    # Também nova viagem se gap muito longo (perda de sinal)
+    df['gap_longo'] = df['time_diff'] > GAP_THRESHOLD_MINUTES
+    
+    # Uma nova viagem começa quando:
+    df['new_trip'] = (
+        df['time_diff'].isna() |      # Primeiro registro do veículo
+        df['parada_prolongada'] |      # Ignição ficou desligada 10+ min ACUMULADOS e religou
+        df['gap_longo']                # Gap de sinal > 20 min
+    )
+    
+    # Classificar tipo de parada (para exibição)
     df['tipo_gap'] = df.apply(
         lambda row: classificar_tipo_parada(
             row['time_diff'] if pd.notna(row['time_diff']) else 0,
