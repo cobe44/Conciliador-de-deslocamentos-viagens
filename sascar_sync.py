@@ -387,3 +387,4 @@ if __name__ == "__main__":
         print(f"Total de posições salvas: {total_salvas}")
         print(f"Taxa de aproveitamento: {(total_salvas/total_recebidas*100) if total_recebidas > 0 else 0:.1f}%")
 
+ 
