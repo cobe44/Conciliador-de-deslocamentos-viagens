@@ -14,7 +14,7 @@ import functools
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Gestão de Frota", layout="wide")
-st.title("🚛 Gestão de Frota")
+st.title("Conciliador de Viagens")
 
 # Funções com cache para melhorar performance
 @st.cache_data(ttl=60)  # Cache por 60 segundos
@@ -654,3 +654,4 @@ with tab_historico:
             )
     except Exception as e:
         st.error(f"Erro ao carregar histórico: {e}")
+
