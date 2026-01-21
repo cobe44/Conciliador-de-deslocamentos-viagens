@@ -147,6 +147,22 @@ def calcular_tempo_ocioso(trip_df):
     return float(tempo_parado) if not pd.isna(tempo_parado) else 0.0
 
 
+def calcular_tempo_motor_off(trip_df):
+    """
+    Calcula tempo total com motor desligado na viagem:
+    Soma do time_diff p/ pontos onde ignicao == 0
+    """
+    if trip_df.empty or 'time_diff' not in trip_df.columns:
+        return 0.0
+        
+    # Filtrar pontos com ignição 0
+    pontos_off = trip_df[
+        (trip_df['ignicao'] == 0) & 
+        (trip_df['time_diff'].notna())
+    ]
+    return pontos_off['time_diff'].sum()
+
+
 def obter_ultimo_raw_id_processado():
     """
     Busca o maior raw_id_fim já processado.
@@ -325,14 +341,27 @@ def processar_deslocamentos(reprocessar_tudo=False):
         ignicao_media=('ignicao', 'mean'),  # Para determinar se estava mais ligado ou desligado
     ).reset_index()
     
-    # 4. Calcular tempo ocioso para cada viagem
-    print("⏱️ Calculando tempo ocioso por viagem...")
+    print("⏱️ Calculando tempo ocioso e motor off por viagem...")
     tempos_ociosos = []
+    tempos_motor_off = []
+    
     for trip_id in stats['trip_id']:
         trip_df = df[df['trip_id'] == trip_id]
-        tempo = calcular_tempo_ocioso(trip_df)
-        tempos_ociosos.append(tempo)
+        
+        # Tempo Ocioso (Motor Ligado + Vel 0)
+        # Ajuste: Ociosidade deve considerar apenas ignicao=1?
+        # A definição original era velocity < threshold.
+        # Vamos refinar: Ocioso = Vel < limit E Ignicao = 1
+        trip_df_ocioso = trip_df[trip_df['ignicao'] == 1]
+        t_ocioso = calcular_tempo_ocioso(trip_df_ocioso)
+        tempos_ociosos.append(t_ocioso)
+        
+        # Tempo Motor Off
+        t_off = calcular_tempo_motor_off(trip_df)
+        tempos_motor_off.append(t_off)
+        
     stats['tempo_ocioso'] = tempos_ociosos
+    stats['tempo_motor_off'] = tempos_motor_off
     
     # Calcular métricas derivadas
     stats['distancia'] = stats['km_final'] - stats['km_inicial']
@@ -380,6 +409,7 @@ def processar_deslocamentos(reprocessar_tudo=False):
             local_fim,
             float(row['tempo_minutos']),
             float(row['tempo_ocioso']),
+            float(row['tempo_motor_off']),
             row['situacao'],
             row['tipo_parada'],
             int(row['qtd_pontos']),
@@ -392,11 +422,11 @@ def processar_deslocamentos(reprocessar_tudo=False):
 
     # 7. Inserir em Batch (sem DELETE prévio!)
     if trips_to_insert:
-        ph_ins = get_placeholder(15)
+        ph_ins = get_placeholder(16)
         query_insert = f"""
             INSERT INTO deslocamentos 
             (placa, data_inicio, data_fim, km_inicial, km_final, distancia, 
-             local_inicio, local_fim, tempo, tempo_ocioso, situacao, 
+             local_inicio, local_fim, tempo, tempo_ocioso, tempo_motor_off, situacao, 
              tipo_parada, qtd_pontos, raw_id_inicio, raw_id_fim, status)
             VALUES ({ph_ins}, 'PENDENTE')
         """
