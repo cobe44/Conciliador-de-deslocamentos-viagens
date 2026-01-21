@@ -409,7 +409,7 @@ def processar_deslocamentos(reprocessar_tudo=False):
     
     print(f"📊 Períodos identificados: {len(periodos)}")
     
-    # Separar apenas deslocamentos (ON) para inserir no banco
+    # Separar deslocamentos (ON) e paradas (OFF)
     deslocamentos = [p for p in periodos if p['tipo'] == 'DESLOCAMENTO']
     paradas = [p for p in periodos if p['tipo'] == 'PARADA']
     
@@ -419,6 +419,7 @@ def processar_deslocamentos(reprocessar_tudo=False):
     # 3. Calcular métricas adicionais para cada deslocamento
     print("⏱️ Calculando métricas por deslocamento...")
     trips_to_insert = []
+    paradas_to_insert = []
     c = conn.cursor()
     
     for i, desloc in enumerate(deslocamentos):
@@ -482,7 +483,56 @@ def processar_deslocamentos(reprocessar_tudo=False):
         if (i + 1) % 10 == 0:
             print(f"  Processando {i+1}/{len(deslocamentos)}: {placa} - {local_inicio} -> {local_fim}")
 
-    # 4. Inserir em Batch
+    # 3.1 Processar paradas (OFF) também
+    print("⏱️ Calculando métricas por parada...")
+    for i, parada in enumerate(paradas):
+        placa = parada['placa']
+        data_inicio = parada['data_inicio']
+        data_fim = parada['data_fim']
+        odo_inicio = parada['odo_inicio'] or 0
+        odo_fim = parada['odo_fim'] or 0
+        distancia = abs(odo_fim - odo_inicio)
+        
+        tempo_minutos = (data_fim - data_inicio).total_seconds() / 60
+        
+        # Para paradas, o tempo de motor off é igual ao tempo total
+        tempo_motor_off = tempo_minutos
+        
+        # Geocodificação (local da parada - início e fim são iguais ou próximos)
+        local_inicio = get_cached_city_name(parada['lat_inicio'], parada['lon_inicio'])
+        local_fim = get_cached_city_name(parada['lat_fim'], parada['lon_fim'])
+        
+        # Buscar pontos para contar
+        df_parada = df[
+            (df['placa'] == placa) & 
+            (df['data_hora'] >= data_inicio) & 
+            (df['data_hora'] <= data_fim)
+        ]
+        qtd_pontos = len(df_parada)
+        
+        paradas_to_insert.append((
+            placa,
+            data_inicio.strftime('%Y-%m-%d %H:%M:%S'),
+            data_fim.strftime('%Y-%m-%d %H:%M:%S'),
+            float(odo_inicio),
+            float(odo_fim),
+            float(distancia),
+            local_inicio,
+            local_fim,
+            float(tempo_minutos),
+            0.0,  # tempo_ocioso (não aplicável para paradas)
+            float(tempo_motor_off),
+            'PARADA',  # situacao
+            'PARADA',  # tipo_parada
+            int(qtd_pontos),
+            int(parada['raw_id_inicio']),
+            int(parada['raw_id_fim']),
+        ))
+        
+        if (i + 1) % 10 == 0:
+            print(f"  Processando parada {i+1}/{len(paradas)}: {placa} - {local_inicio}")
+
+    # 4. Inserir deslocamentos em Batch
     if trips_to_insert:
         ph_ins = get_placeholder(16)
         query_insert = f"""
@@ -498,6 +548,22 @@ def processar_deslocamentos(reprocessar_tudo=False):
     else:
         print("ℹ️ Nenhum deslocamento novo para inserir.")
     
+    # 4.1 Inserir paradas em Batch
+    if paradas_to_insert:
+        ph_ins = get_placeholder(16)
+        query_insert = f"""
+            INSERT INTO deslocamentos 
+            (placa, data_inicio, data_fim, km_inicial, km_final, distancia, 
+             local_inicio, local_fim, tempo, tempo_ocioso, tempo_motor_off, situacao, 
+             tipo_parada, qtd_pontos, raw_id_inicio, raw_id_fim, status)
+            VALUES ({ph_ins}, 'PENDENTE')
+        """
+        c.executemany(query_insert, paradas_to_insert)
+        conn.commit()
+        print(f"✅ Sucesso: {len(paradas_to_insert)} paradas NOVAS inseridas no banco.")
+    else:
+        print("ℹ️ Nenhuma parada nova para inserir.")
+    
     conn.close()
     
     # Resumo final
@@ -507,7 +573,7 @@ def processar_deslocamentos(reprocessar_tudo=False):
     print(f"  Posições processadas: {len(df)}")
     print(f"  Períodos identificados: {len(periodos)}")
     print(f"  Deslocamentos inseridos: {len(trips_to_insert)}")
-    print(f"  Paradas detectadas: {len(paradas)}")
+    print(f"  Paradas inseridas: {len(paradas_to_insert)}")
 
 
 
