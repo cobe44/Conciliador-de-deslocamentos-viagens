@@ -14,7 +14,7 @@ import functools
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Gestão de Frota", layout="wide")
-st.title("Conciliador de Viagens")
+st.title("🚛 Gestão de Frota")
 
 # Funções com cache para melhorar performance
 @st.cache_data(ttl=60)  # Cache por 60 segundos
@@ -285,8 +285,8 @@ with tab_fechamento:
                 
                 df_display['Selecionar'] = False
                 
-                # Data editor para seleção
-                cols_editor = ['Selecionar', 'Tipo', 'Data Início', 'Data Fim', 'Tempo', 'Parado (On)', 'Desligado', 'local_inicio', 'local_fim', 'Distância']
+                # Data editor para seleção (Motor Lig e Off movidos para o final)
+                cols_editor = ['Selecionar', 'Tipo', 'Data Início', 'Data Fim', 'Tempo', 'local_inicio', 'local_fim', 'Distância', 'Parado (On)', 'Desligado']
                 df_edit = st.data_editor(
                     df_display[cols_editor],
                     column_config={
@@ -654,4 +654,3 @@ with tab_historico:
             )
     except Exception as e:
         st.error(f"Erro ao carregar histórico: {e}")
-
