@@ -84,14 +84,23 @@ def limpar_nome_local(nome):
     return resultado.strip()
 
 
-@lru_cache(maxsize=2000)
+@lru_cache(maxsize=4000)
 def get_cached_city_name(lat, lon):
     """
     Geocodificação reversa com cache e arredondamento para maximizar hits.
     Arredonda para 3 casas (aprox 100m) para agrupar locais próximos.
     """
-    lat_r = round(lat, 3)
-    lon_r = round(lon, 3)
+    # OTIMIZAÇÃO: Pular geocodificação externa temporariamente para evitar timeouts
+    # Usar apenas POIs conhecidos ou coordenadas
+    SKIP_GEOCODING_API = True
+    
+    try:
+        lat = float(lat)
+        lon = float(lon)
+        lat_r = round(lat, 3)
+        lon_r = round(lon, 3)
+    except (ValueError, TypeError):
+        return "Coordenadas Inválidas"
     
     # 1. Tentar Base Nuporanga (POIs locais)
     for name, coords_list in POIS_NUPORANGA.items():
@@ -99,12 +108,13 @@ def get_cached_city_name(lat, lon):
             if abs(lat_r - p_lat) < POI_RADIUS and abs(lon_r - p_lon) < POI_RADIUS:
                 return name
 
-    # 2. OpenStreetMap / Nominatim
-    if not GEOPY_AVAILABLE:
-        return "Local Desconhecido"
+    # 2. Se API desabilitada ou falhando muito, retornar coordenada
+    if SKIP_GEOCODING_API or not GEOPY_AVAILABLE:
+        return f"{lat_r}, {lon_r}"
         
     try:
-        geolocator = Nominatim(user_agent="frota_cf_v3", timeout=3)
+        # Nominatim tem limite de 1req/s e timeouts frequentes em batch
+        geolocator = Nominatim(user_agent="frota_cf_v5", timeout=2)
         loc = geolocator.reverse(f"{lat_r}, {lon_r}", language='pt')
         if loc and loc.address:
             address = loc.raw.get('address', {})
