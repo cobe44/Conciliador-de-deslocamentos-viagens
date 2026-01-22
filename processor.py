@@ -90,9 +90,10 @@ def get_cached_city_name(lat, lon):
     Geocodificação reversa com cache e arredondamento para maximizar hits.
     Arredonda para 3 casas (aprox 100m) para agrupar locais próximos.
     """
-    # OTIMIZAÇÃO: Pular geocodificação externa temporariamente para evitar timeouts
-    # Usar apenas POIs conhecidos ou coordenadas
-    SKIP_GEOCODING_API = True
+    # Configuração: False = tenta API, True = apenas POIs/coordenadas
+    # Reativado conforme solicitação do usuário para garantir nomes
+    SKIP_GEOCODING_API = False
+    GEOCODING_TIMEOUT = 3  # Timeout maior para garantir resposta
     
     try:
         lat = float(lat)
@@ -102,19 +103,19 @@ def get_cached_city_name(lat, lon):
     except (ValueError, TypeError):
         return "Coordenadas Inválidas"
     
-    # 1. Tentar Base Nuporanga (POIs locais)
+    # 1. Tentar Base Nuporanga (POIs locais) - sempre rápido
     for name, coords_list in POIS_NUPORANGA.items():
         for (p_lat, p_lon) in coords_list:
             if abs(lat_r - p_lat) < POI_RADIUS and abs(lon_r - p_lon) < POI_RADIUS:
                 return name
 
-    # 2. Se API desabilitada ou falhando muito, retornar coordenada
+    # 2. Se API desabilitada, retornar coordenada
     if SKIP_GEOCODING_API or not GEOPY_AVAILABLE:
         return f"{lat_r}, {lon_r}"
         
     try:
-        # Nominatim tem limite de 1req/s e timeouts frequentes em batch
-        geolocator = Nominatim(user_agent="frota_cf_v5", timeout=2)
+        # Geocodificação com timeout configurado
+        geolocator = Nominatim(user_agent="frota_cf_v5", timeout=GEOCODING_TIMEOUT)
         loc = geolocator.reverse(f"{lat_r}, {lon_r}", language='pt')
         if loc and loc.address:
             address = loc.raw.get('address', {})
@@ -330,18 +331,27 @@ def classificar_deslocamentos_v5(df):
         # Verificar se o último período ainda está "em curso"
         agora = datetime.now()
         
+        # Obter o último raw_id do lote processado para esta placa
+        ultimo_raw_id_lote = df_placa['raw_id'].max()
+        
         for idx_p, p in enumerate(periodos_final):
             inicio_idx = p['inicio_idx']
             fim_idx = p['fim_idx']
             
             data_fim_periodo = df_placa.loc[fim_idx, 'data_hora']
+            raw_id_fim_periodo = df_placa.loc[fim_idx, 'raw_id']
             
-            # Se é o último período E terminou há menos de 30 min, não inserir (em curso)
+            # Verificar se período está "em curso" usando múltiplos critérios:
+            # 1. É o último período da placa
+            # 2. Terminou há menos de 60 minutos OU raw_id_fim é o último do lote
             is_ultimo = (idx_p == len(periodos_final) - 1)
             tempo_desde_fim = (agora - data_fim_periodo.to_pydatetime().replace(tzinfo=None)).total_seconds() / 60
+            is_ultimo_raw_id = (raw_id_fim_periodo == ultimo_raw_id_lote)
             
-            if is_ultimo and tempo_desde_fim < 30:
+            # Período em curso se: é o último E (terminou recentemente OU é o último ponto recebido)
+            if is_ultimo and (tempo_desde_fim < 60 or is_ultimo_raw_id):
                 # Período ainda em curso, pular para próxima execução
+                logger.info(f"⏳ Período em curso ignorado: {placa} {p['tipo']} (raw_id_fim={raw_id_fim_periodo}, último={ultimo_raw_id_lote})")
                 continue
             
             resultados.append({
@@ -518,6 +528,230 @@ def classificar_deslocamentos_v4(df):
     
     return resultados
 
+    conn.close()
+    return ultimo_id
+
+
+def obter_ultimo_estado_banco(placa):
+    """
+    V6: Busca o último registro de deslocamento/parada do veículo no banco.
+    Isso permite continuar o estado anterior (evitando gaps) em vez de começar do zero.
+    """
+    conn = get_connection()
+    c = conn.cursor()
+    
+    # Busca o último registro (seja CONCLUIDO ou EM_CURSO)
+    query = """
+    SELECT id, tipo_parada, data_inicio, data_fim, km_inicial, km_final, 
+           distancia, local_inicio, local_fim, raw_id_fim
+    FROM deslocamentos 
+    WHERE placa = %s 
+    ORDER BY data_fim DESC, id DESC 
+    LIMIT 1
+    """
+    
+    try:
+        c.execute(query, (placa,))
+        row = c.fetchone()
+        
+        if row:
+            # Converter para dicionário de estado
+            return {
+                'id': row[0],
+                'tipo': 'MOVIMENTO' if row[1] == 'MOVIMENTO' else 'PARADA', # Normalizar nome
+                'data_fim': pd.to_datetime(row[3]),
+                'km_final': row[5],
+                'local_fim': row[8],
+                'raw_id_fim': row[9]
+            }
+    except Exception as e:
+        logger.error(f"Erro ao buscar último estado para {placa}: {e}")
+        
+    conn.close()
+    return None
+
+def classificar_deslocamentos_v6_persistente(df, estado_atual=None):
+    """
+    Classificador V6 - Máquina de Estados Persistente
+    
+    Diferente do V5, este classificador leva em conta o último estado gravado no banco.
+    
+    Cenários:
+    1. Sem estado anterior: Inicia lógica V5 normal
+    2. Anterior = MOVIMENTO:
+       - Novos dados continuam movendo? -> UPDATE registro anterior (estende data_fim)
+       - Parou? -> UPDATE registro anterior (fecha) + INSERT nova Parada (inicia onde mov terminou)
+       
+    3. Anterior = PARADA:
+       - Novos dados continuam parados? -> UPDATE registro anterior
+       - Moveu? -> UPDATE registro anterior (fecha) + INSERT novo Movimento
+       
+    Returns:
+        updates: Lista de atualizações em registros existentes
+        inserts: Lista de novos registros a criar
+        novo_estado: O estado final após processar o lote
+    """
+    updates = []
+    inserts = []
+    
+    # Se não temos dados novos, retorna nada
+    if df.empty:
+        return updates, inserts, estado_atual
+
+    # Ordenar por garantia
+    df = df.sort_values('data_hora').reset_index(drop=True)
+    
+    # Calcular métricas básicas para análise (velocidade, tempo, dist)
+    df['time_diff'] = df['data_hora'].diff().dt.total_seconds() / 60
+    
+    # Lógica de Estado
+    # Se não tem estado anterior, assumimos o primeiro ponto como início de algo
+    if estado_atual is None:
+        # Tenta inferir pelo primeiro ponto
+        primeiro = df.iloc[0]
+        vel = primeiro['velocidade']
+        tipo_inicial = 'MOVIMENTO' if vel >= VELOCIDADE_MOVIMENTO else 'PARADA'
+        
+        # Cria um estado virtual "novo" para começar a processar
+        estado_atual = {
+            'id': None, # None indica que é um registro novo, ainda não salvo
+            'tipo': tipo_inicial,
+            'inicio_idx': 0,
+            'data_inicio': primeiro['data_hora'],
+            'data_fim': primeiro['data_hora'],
+            'raw_id_fim': primeiro['raw_id']
+        }
+    
+    # Processar ponto a ponto (ou em blocos para performance)
+    # Por simplicidade e robustez V6, vamos iterar e detectar transições
+    
+    # Processar ponto a ponto para detectar transições
+    pontos = df.to_dict('records')
+    
+    # Se estado_atual veio do banco, precisamos carregar seu 'contexto' (ID, tipo)
+    current_state_type = estado_atual['tipo']
+    current_db_id = estado_atual.get('id')
+    current_start_idx = 0  # Índice relativo ao DF atual onde começou este segmento
+    
+    # Buffer para confirmar transição
+    transition_buffer = []  # Lista de pontos candidatos a mudança
+    
+    for i, p in enumerate(pontos):
+        # Determinar estado instantâneo deste ponto
+        is_moving = p['velocidade'] >= VELOCIDADE_MOVIMENTO
+        point_type = 'MOVIMENTO' if is_moving else 'PARADA'
+        
+        # Lógica de Confirmação de Transição
+        if point_type != current_state_type:
+            # Potencial mudança de estado! Adicionar ao buffer
+            transition_buffer.append(p)
+            
+            # Verificar se confirmamos a mudança
+            start_transition = transition_buffer[0]['data_hora']
+            end_transition = p['data_hora']
+            duration_minutes = (end_transition - start_transition).total_seconds() / 60
+            
+            confirm_threshold = GAP_CONSOLIDACAO if current_state_type == 'MOVIMENTO' else MIN_DURACAO_PERIODO
+            
+            if duration_minutes >= confirm_threshold:
+                # MUDANÇA CONFIRMADA!
+                # A mudança aconteceu em transition_buffer[0] (retroativo)
+                transition_start_point = transition_buffer[0]
+                
+                # 1. Fechar estado anterior (current)
+                # Se tem ID, é UPDATE. Se não, é INSERT de um novo fechado.
+                prev_end_point = pontos[i - len(transition_buffer)] # Ponto antes da transição começar
+                
+                # Se não houver ponto anterior no DF (mudança logo no início), usar o próprio início da transição
+                # como fim do anterior (continuidade perfeita)
+                data_fim_anterior = transition_start_point['data_hora']
+                
+                if current_db_id:
+                    # UPDATE registro existente no banco
+                    updates.append({
+                        'id': current_db_id,
+                        'data_fim': data_fim_anterior,
+                        'km_final': transition_start_point['odometro'], # Aproximado
+                        'local_fim': f"{transition_start_point['latitude']}, {transition_start_point['longitude']}", # Será geocodificado depois
+                        'raw_id_fim': transition_start_point['raw_id']
+                    })
+                else:
+                    # CORREÇÃO V6: Fechar o INSERT anterior que ainda estava aberto
+                    # Isso acontece quando há múltiplas transições no mesmo lote
+                    if inserts:
+                        # Preencher data_fim do último insert com o momento da transição
+                        inserts[-1]['data_fim'] = data_fim_anterior
+                        inserts[-1]['km_final'] = transition_start_point['odometro']
+                        inserts[-1]['local_fim'] = f"{transition_start_point['latitude']}, {transition_start_point['longitude']}"
+                        inserts[-1]['raw_id_fim'] = transition_start_point['raw_id']
+                
+                # 2. Iniciar novo estado
+                current_state_type = point_type
+                current_db_id = None # Novo estado, ainda não tem ID no banco
+                current_start_idx = i - len(transition_buffer) + 1 # Ajustar índice (aprox)
+                transition_buffer = [] # Limpar buffer
+                
+                # Adicionar novo registro para INSERT
+                inserts.append({
+                    'tipo': current_state_type,
+                    'data_inicio': data_fim_anterior, # Início = Fim do anterior (GAP ZERO)
+                    'km_inicial': transition_start_point['odometro'],
+                    'local_inicio': f"{transition_start_point['latitude']}, {transition_start_point['longitude']}",
+                    'raw_id_inicio': transition_start_point['raw_id'],
+                    # Fim será definido quando fechar ou no final do lote
+                })
+                
+        else:
+            # Ponto confirma o estado atual (resetar buffer de transição)
+            # Ex: Estava MOVIMENTO, veio PARADA, PARADA (buffer), depois MOVIMENTO (reset)
+            if transition_buffer:
+                transition_buffer = []
+        
+    # Fim do loop: O que sobrou é o estado atual "EM CURSO"
+    # Precisamos atualizar o registro correspondente (seja UPDATE no banco ou UPDATE no INSERT pendente)
+    
+    ultimo_ponto = pontos[-1]
+    
+    if current_db_id:
+        # O estado continuou o mesmo do banco o tempo todo (ou desde a última transição confirmada)
+        updates.append({
+            'id': current_db_id,
+            'data_fim': ultimo_ponto['data_hora'],
+            'km_final': ultimo_ponto['odometro'],
+            'local_fim': f"{ultimo_ponto['latitude']}, {ultimo_ponto['longitude']}",
+            'raw_id_fim': ultimo_ponto['raw_id']
+        })
+    elif inserts:
+        # Temos um insert novo aberto, vamos fechar ele no fim deste lote
+        inserts[-1]['data_fim'] = ultimo_ponto['data_hora']
+        inserts[-1]['km_final'] = ultimo_ponto['odometro']
+        inserts[-1]['local_fim'] = f"{ultimo_ponto['latitude']}, {ultimo_ponto['longitude']}"
+        inserts[-1]['raw_id_fim'] = ultimo_ponto['raw_id']
+    else:
+        # Caso raro: Estado novo desde o início mas sem transição anterior
+        # (Ex: Primeiro dado da vida do caminhão)
+        inserts.append({
+            'tipo': current_state_type,
+            'data_inicio': pontos[0]['data_hora'],
+            'km_inicial': pontos[0]['odometro'],
+            'local_inicio': f"{pontos[0]['latitude']}, {pontos[0]['longitude']}",
+            'raw_id_inicio': pontos[0]['raw_id'],
+            'data_fim': ultimo_ponto['data_hora'],
+            'km_final': ultimo_ponto['odometro'],
+            'local_fim': f"{ultimo_ponto['latitude']}, {ultimo_ponto['longitude']}",
+            'raw_id_fim': ultimo_ponto['raw_id']
+        })
+
+    # Retornar o novo estado para o próximo lote (se precisarmos em memória)
+    novo_estado = {
+        'tipo': current_state_type,
+        'id': current_db_id or 'PENDING_INSERT'
+    }
+
+    return updates, inserts, novo_estado
+
+
+
 def obter_ultimo_raw_id_processado():
     """
     Busca o maior raw_id_fim já processado.
@@ -532,28 +766,20 @@ def obter_ultimo_raw_id_processado():
         ultimo_id = result[0] if result and result[0] else 0
     except Exception as e:
         # Coluna pode não existir em bancos antigos
-        print(f"⚠️ Erro ao buscar último ID processado: {e}")
+        # print(f"⚠️ Erro ao buscar último ID processado: {e}")
         ultimo_id = 0
     
     conn.close()
     return ultimo_id
 
-
 def processar_deslocamentos(reprocessar_tudo=False):
     """
-    Processador V5 - Baseado em Velocidade + Consolidação
+    Processador V6 - Estado Persistente
     
-    Lógica:
-    - MOVIMENTO: velocidade >= 3 km/h
-    - PARADA: velocidade < 3 km/h
-    - Períodos < 5 min são absorvidos no anterior
-    - Paradas < 15 min entre movimentos são consolidadas
-    
-    Args:
-        reprocessar_tudo: Se True, ignora processamento incremental e reprocessa tudo.
-                         CUIDADO: Isso pode criar duplicatas se não limpar antes!
+    Lógica baseada em Máquina de Estados que persiste no banco para eliminar gaps.
+    Sempre carrega o último estado do banco e continua a partir dele.
     """
-    print("🚀 Iniciando Processador V5 (Velocidade + Consolidação)...")
+    print("🚀 Iniciando Processador V6 (Estado Persistente)...")
     
     # Garantir que as novas colunas existam
     try:
@@ -562,6 +788,7 @@ def processar_deslocamentos(reprocessar_tudo=False):
         print(f"⚠️ Migração: {e}")
     
     conn = get_connection()
+    c = conn.cursor()
     
     # Determinar ponto de início
     if reprocessar_tudo:
@@ -585,229 +812,149 @@ def processar_deslocamentos(reprocessar_tudo=False):
             p.velocidade
         FROM posicoes_raw p
         JOIN veiculos v ON p.id_veiculo = v.id_sascar
-        WHERE p.id > {get_placeholder(1)}
+        WHERE p.id > %s
         ORDER BY p.id_veiculo, p.data_hora
     """
     
-    df = pd.read_sql(query, conn, params=(ultimo_id,))
+    try:
+        df = pd.read_sql(query, conn, params=(ultimo_id,))
+    except Exception as e:
+        print(f"Erro ao ler dados: {e}")
+        conn.close()
+        return []
     
     if df.empty:
         print("✅ Nenhum dado novo para processar.")
         conn.close()
-        return
+        return []
     
     print(f"📦 Dados novos carregados: {len(df)} linhas")
     
     # Converter data
     df['data_hora'] = pd.to_datetime(df['data_hora'])
     
-    # 2. Usar classificação V5 baseada em velocidade com consolidação
-    print("🔄 Classificando períodos com lógica V5 (velocidade + consolidação)...")
-    periodos = classificar_deslocamentos_v5(df)
+    print("🔄 Classificando com Lógica V6 (Máquina de Estados Persistente)...")
     
-    print(f"📊 Períodos identificados: {len(periodos)}")
+    total_updates = 0
+    total_inserts = 0
+    placas_processadas = 0
     
-    # Separar deslocamentos (ON) e paradas (OFF)
-    deslocamentos = [p for p in periodos if p['tipo'] == 'DESLOCAMENTO']
-    paradas = [p for p in periodos if p['tipo'] == 'PARADA']
+    for placa in df['placa'].unique():
+        df_placa = df[df['placa'] == placa].copy()
+        placas_processadas += 1
+        
+        # Carregar último estado do banco
+        estado_banco = obter_ultimo_estado_banco(placa)
+        
+        # Rodar classificador V6
+        updates, inserts, novo_estado = classificar_deslocamentos_v6_persistente(df_placa, estado_banco)
+        
+        # Executar UPDATES
+        if updates:
+            total_updates += len(updates)
+            for upd in updates:
+                # Geocodificar local_fim se for coordenada
+                local_fim_raw = upd.get('local_fim', '')
+                try:
+                    parts = local_fim_raw.split(',')
+                    if len(parts) == 2:
+                        lat, lon = float(parts[0].strip()), float(parts[1].strip())
+                        local_fim = get_cached_city_name(lat, lon)
+                    else:
+                        local_fim = local_fim_raw
+                except:
+                    local_fim = local_fim_raw
+                    
+                c.execute("""
+                    UPDATE deslocamentos 
+                    SET data_fim = %s, km_final = %s, local_fim = %s, raw_id_fim = %s,
+                        tempo = EXTRACT(EPOCH FROM (%s - data_inicio))/60
+                    WHERE id = %s
+                """, (
+                    upd['data_fim'], upd['km_final'], local_fim, upd['raw_id_fim'],
+                    upd['data_fim'], upd['id']
+                ))
+        
+        # Executar INSERTS
+        if inserts:
+            total_inserts += len(inserts)
+            for ins in inserts:
+                dist = (ins.get('km_final', 0) - ins['km_inicial']) if 'km_final' in ins else 0
+                
+                # Inicia como 'PENDENTE' para aparecer na interface de fechamento
+                # Podemos também usar 'EM_CURSO' se ainda não fechou, mas interface filtra PENDENTE
+                status = 'PENDENTE'
+                
+                # CORREÇÃO V6: Se o registro é EM_CURSO, ele pode não ter data_fim definida ainda no dicionário ins.
+                # Mas o banco exige NOT NULL. Então usamos a última data conhecida como data_fim provisória.
+                # A lógica V6 vai estender essa data via UPDATE nas próximas execuções.
+                
+                dt_fim = ins.get('data_fim', ins['data_inicio']) # Se não tem fim, fim = inicio (duração 0)
+                km_final = ins.get('km_final', ins['km_inicial'])
+                raw_id_fim = ins.get('raw_id_fim', ins['raw_id_inicio'])
+                
+                # GEOCODIFICAÇÃO DIRETA: Converter lat/long para nomes de cidades
+                # O local_inicio e local_fim vêm como "lat, lon" do classificador
+                local_inicio_raw = ins.get('local_inicio', '')
+                local_fim_raw = ins.get('local_fim', ins.get('local_inicio', ''))
+                
+                # Extrair lat/lon e geocodificar
+                try:
+                    parts_ini = local_inicio_raw.split(',')
+                    if len(parts_ini) == 2:
+                        lat_i, lon_i = float(parts_ini[0].strip()), float(parts_ini[1].strip())
+                        local_inicio = get_cached_city_name(lat_i, lon_i)
+                    else:
+                        local_inicio = local_inicio_raw
+                except:
+                    local_inicio = local_inicio_raw
+                
+                try:
+                    parts_fim = local_fim_raw.split(',')
+                    if len(parts_fim) == 2:
+                        lat_f, lon_f = float(parts_fim[0].strip()), float(parts_fim[1].strip())
+                        local_fim = get_cached_city_name(lat_f, lon_f)
+                    else:
+                        local_fim = local_fim_raw
+                except:
+                    local_fim = local_fim_raw
+                
+                c.execute("""
+                    INSERT INTO deslocamentos (
+                        placa, tipo_parada, data_inicio, data_fim, 
+                        km_inicial, km_final, distancia, 
+                        local_inicio, local_fim, 
+                        raw_id_inicio, raw_id_fim,
+                        status
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    placa, ins['tipo'], ins['data_inicio'], dt_fim,
+                    ins['km_inicial'], km_final, dist,
+                    local_inicio, local_fim,
+                    ins['raw_id_inicio'], raw_id_fim,
+                    status
+                ))
+        
+        conn.commit()
     
-    print(f"   - Deslocamentos (ON): {len(deslocamentos)}")
-    print(f"   - Paradas (OFF): {len(paradas)}")
-    
-    # 3. Calcular métricas adicionais para cada deslocamento
-    print("⏱️ Calculando métricas por deslocamento...")
-    trips_to_insert = []
-    paradas_to_insert = []
-    c = conn.cursor()
-    
-    for i, desloc in enumerate(deslocamentos):
-        placa = desloc['placa']
-        data_inicio = desloc['data_inicio']
-        data_fim = desloc['data_fim']
-        odo_inicio = desloc['odo_inicio'] or 0
-        odo_fim = desloc['odo_fim'] or 0
-        distancia = abs(odo_fim - odo_inicio)
-        
-        # Filtrar viagens muito curtas (ruído)
-        if distancia < MIN_DISTANCIA_VIAGEM:
-            continue
-        
-        # Filtrar viagens impossíveis (>2000km)
-        if distancia > 2000:
-            continue
-        
-        tempo_minutos = (data_fim - data_inicio).total_seconds() / 60
-        
-        # Buscar pontos do deslocamento para calcular ociosidade
-        df_desloc = df[
-            (df['placa'] == placa) & 
-            (df['data_hora'] >= data_inicio) & 
-            (df['data_hora'] <= data_fim)
-        ]
-        
-        # Calcular tempo ocioso (velocidade < 3 km/h com ignição on)
-        df_desloc_copy = df_desloc.copy()
-        df_desloc_copy['time_diff'] = df_desloc_copy['data_hora'].diff().dt.total_seconds() / 60
-        tempo_ocioso = calcular_tempo_ocioso(df_desloc_copy[df_desloc_copy['ignicao'] == 1])
-        
-        # Calcular tempo motor off
-        tempo_motor_off = calcular_tempo_motor_off(df_desloc_copy)
-        
-        # Geocodificação
-        local_inicio = get_cached_city_name(desloc['lat_inicio'], desloc['lon_inicio'])
-        local_fim = get_cached_city_name(desloc['lat_fim'], desloc['lon_fim'])
-        
-        qtd_pontos = len(df_desloc)
-        
-        trips_to_insert.append((
-            placa,
-            data_inicio.strftime('%Y-%m-%d %H:%M:%S'),
-            data_fim.strftime('%Y-%m-%d %H:%M:%S'),
-            float(odo_inicio),
-            float(odo_fim),
-            float(distancia),
-            local_inicio,
-            local_fim,
-            float(tempo_minutos),
-            float(tempo_ocioso),
-            float(tempo_motor_off),
-            'MOVIMENTO',  # situacao
-            'MOVIMENTO',  # tipo_parada
-            int(qtd_pontos),
-            int(desloc['raw_id_inicio']),
-            int(desloc['raw_id_fim']),
-        ))
-        
-        if (i + 1) % 10 == 0:
-            print(f"  Processando {i+1}/{len(deslocamentos)}: {placa} - {local_inicio} -> {local_fim}")
-
-    # 3.1 Processar paradas (OFF) também
-    print("⏱️ Calculando métricas por parada...")
-    for i, parada in enumerate(paradas):
-        placa = parada['placa']
-        data_inicio = parada['data_inicio']
-        data_fim = parada['data_fim']
-        odo_inicio = parada['odo_inicio'] or 0
-        odo_fim = parada['odo_fim'] or 0
-        distancia = abs(odo_fim - odo_inicio)
-        
-        tempo_minutos = (data_fim - data_inicio).total_seconds() / 60
-        
-        # Geocodificação (local da parada - início e fim são iguais ou próximos)
-        local_inicio = get_cached_city_name(parada['lat_inicio'], parada['lon_inicio'])
-        local_fim = get_cached_city_name(parada['lat_fim'], parada['lon_fim'])
-        
-        # Buscar pontos para contar e calcular ociosidade
-        df_parada = df[
-            (df['placa'] == placa) & 
-            (df['data_hora'] >= data_inicio) & 
-            (df['data_hora'] <= data_fim)
-        ]
-        qtd_pontos = len(df_parada)
-        
-        # Calcular tempo ocioso real (motor ligado mas parado) e tempo motor off
-        df_parada_copy = df_parada.copy()
-        df_parada_copy['time_diff'] = df_parada_copy['data_hora'].diff().dt.total_seconds() / 60
-        
-        # Tempo ocioso = tempo com ignição ON e velocidade < 3 km/h (motor ligado, parado)
-        tempo_ocioso = calcular_tempo_ocioso(df_parada_copy[df_parada_copy['ignicao'] == 1])
-        
-        # Tempo motor off = tempo total - tempo com ignição ON
-        tempo_motor_off = calcular_tempo_motor_off(df_parada_copy)
-        
-        # Se não há dados suficientes, assume todo o tempo como motor off
-        if tempo_motor_off == 0 and tempo_ocioso == 0:
-            tempo_motor_off = tempo_minutos
-        
-        paradas_to_insert.append((
-            placa,
-            data_inicio.strftime('%Y-%m-%d %H:%M:%S'),
-            data_fim.strftime('%Y-%m-%d %H:%M:%S'),
-            float(odo_inicio),
-            float(odo_fim),
-            float(distancia),
-            local_inicio,
-            local_fim,
-            float(tempo_minutos),
-            float(tempo_ocioso),  # tempo com motor ligado mas parado
-            float(tempo_motor_off),  # tempo com motor desligado
-            'PARADA',  # situacao
-            'PARADA',  # tipo_parada
-            int(qtd_pontos),
-            int(parada['raw_id_inicio']),
-            int(parada['raw_id_fim']),
-        ))
-        
-        if (i + 1) % 10 == 0:
-            print(f"  Processando parada {i+1}/{len(paradas)}: {placa} - {local_inicio}")
-
-    # 4. Inserir deslocamentos em Batch (lotes menores para evitar timeout)
-    BATCH_SIZE = 50
-    if trips_to_insert:
-        ph_ins = get_placeholder(16)
-        query_insert = f"""
-            INSERT INTO deslocamentos 
-            (placa, data_inicio, data_fim, km_inicial, km_final, distancia, 
-             local_inicio, local_fim, tempo, tempo_ocioso, tempo_motor_off, situacao, 
-             tipo_parada, qtd_pontos, raw_id_inicio, raw_id_fim, status)
-            VALUES ({ph_ins}, 'PENDENTE')
-        """
-        # Inserir em lotes menores para evitar timeout
-        for i in range(0, len(trips_to_insert), BATCH_SIZE):
-            batch = trips_to_insert[i:i + BATCH_SIZE]
-            try:
-                c.executemany(query_insert, batch)
-                conn.commit()
-            except Exception as e:
-                print(f"⚠️ Erro no lote {i//BATCH_SIZE + 1}: {e}")
-                # Reconectar e tentar novamente
-                conn = get_connection()
-                c = conn.cursor()
-                c.executemany(query_insert, batch)
-                conn.commit()
-        print(f"✅ Sucesso: {len(trips_to_insert)} deslocamentos NOVOS inseridos no banco.")
-    else:
-        print("ℹ️ Nenhum deslocamento novo para inserir.")
-    
-    # 4.1 Inserir paradas em Batch (lotes menores para evitar timeout)
-    if paradas_to_insert:
-        ph_ins = get_placeholder(16)
-        query_insert = f"""
-            INSERT INTO deslocamentos 
-            (placa, data_inicio, data_fim, km_inicial, km_final, distancia, 
-             local_inicio, local_fim, tempo, tempo_ocioso, tempo_motor_off, situacao, 
-             tipo_parada, qtd_pontos, raw_id_inicio, raw_id_fim, status)
-            VALUES ({ph_ins}, 'PENDENTE')
-        """
-        # Inserir em lotes menores para evitar timeout
-        for i in range(0, len(paradas_to_insert), BATCH_SIZE):
-            batch = paradas_to_insert[i:i + BATCH_SIZE]
-            try:
-                c.executemany(query_insert, batch)
-                conn.commit()
-            except Exception as e:
-                print(f"⚠️ Erro no lote de paradas {i//BATCH_SIZE + 1}: {e}")
-                # Reconectar e tentar novamente
-                conn = get_connection()
-                c = conn.cursor()
-                c.executemany(query_insert, batch)
-                conn.commit()
-        print(f"✅ Sucesso: {len(paradas_to_insert)} paradas NOVAS inseridas no banco.")
-    else:
-        print("ℹ️ Nenhuma parada nova para inserir.")
+    print("\n" + "="*50)
+    print("📊 RESUMO DO PROCESSAMENTO V6")
+    print("="*50)
+    print(f"  Placas processadas: {placas_processadas}")
+    print(f"  Registros atualizados: {total_updates}")
+    print(f"  Novos registros: {total_inserts}")
     
     conn.close()
     
-    # Resumo final
-    print("\n" + "="*50)
-    print("📊 RESUMO DO PROCESSAMENTO V5")
-    print("="*50)
-    print(f"  Posições processadas: {len(df)}")
-    print(f"  Períodos identificados: {len(periodos)}")
-    print(f"  Deslocamentos inseridos: {len(trips_to_insert)}")
-    print(f"  Paradas inseridas: {len(paradas_to_insert)}")
-
-
+    # 3. Geo-decodificação assíncrona (Backfill)
+    try:
+        from backfill_names import processar_backfill
+        print("🌍 Iniciando backfill de geocodificação...")
+        processar_backfill()
+    except Exception as e:
+        print(f"⚠️ Erro no backfill: {e}")
+        
+    return [] # Compatibilidade + 1
 
 
 def consolidar_periodos_consecutivos(tolerancia_minutos=30):
@@ -902,14 +1049,9 @@ def consolidar_periodos_consecutivos(tolerancia_minutos=30):
                 if gap <= tolerancia_minutos:
                     # Mesmo tipo (PARADA com PARADA, MOVIMENTO com MOVIMENTO)
                     if reg_atual['tipo'] == reg_prox['tipo']:
-                        if reg_atual['tipo'] == 'PARADA':
-                            # PARADAS: mesmo local de início
-                            if grupo[-1]['local_inicio'] == reg_prox['local_inicio']:
-                                pode_consolidar = True
-                        else:
-                            # MOVIMENTOS: local_fim do anterior = local_inicio do próximo
-                            if grupo[-1]['local_fim'] == reg_prox['local_inicio']:
-                                pode_consolidar = True
+                        # V5: Sempre consolida se mesmo tipo e gap pequeno
+                        # Ignora comparação de local (coordenadas GPS variam levemente)
+                        pode_consolidar = True
                 
                 if pode_consolidar:
                     grupo.append(reg_prox)
@@ -989,24 +1131,24 @@ def consolidar_periodos_consecutivos(tolerancia_minutos=30):
 
 def limpar_e_reprocessar():
     """
-    Limpa TODOS os deslocamentos pendentes e reprocessa do zero.
+    Limpa TODOS os deslocamentos e reprocessa do zero.
     USE COM CUIDADO - apenas quando necessário reconstruir tudo.
     """
-    print("⚠️ ATENÇÃO: Limpando todos os deslocamentos PENDENTES...")
+    print("⚠️ ATENÇÃO: Limpando TODOS os deslocamentos para reprocessamento completo...")
     
     conn = get_connection()
     c = conn.cursor()
     
     # Contar antes
-    c.execute("SELECT COUNT(*) FROM deslocamentos WHERE status = 'PENDENTE'")
+    c.execute("SELECT COUNT(*) FROM deslocamentos")
     qtd_antes = c.fetchone()[0]
     
-    # Deletar apenas pendentes (não afeta processados/vinculados a viagens)
-    c.execute("DELETE FROM deslocamentos WHERE status = 'PENDENTE'")
+    # Deletar TODOS os deslocamentos (reprocessar = reconstruir do zero)
+    c.execute("DELETE FROM deslocamentos")
     conn.commit()
     conn.close()
     
-    print(f"🗑️ {qtd_antes} deslocamentos pendentes removidos.")
+    print(f"🗑️ {qtd_antes} deslocamentos removidos.")
     print("🔄 Iniciando reprocessamento completo...")
     
     # Reprocessar tudo
@@ -1121,8 +1263,7 @@ if __name__ == "__main__":
         
         if comando == "--reprocessar":
             limpar_e_reprocessar()
-            # Consolidar após reprocessar
-            consolidar_periodos_consecutivos()
+            # V6: Não precisa consolidar, a lógica já elimina gaps
         elif comando == "--limpar-duplicatas":
             remover_duplicatas()
         elif comando == "--corrigir-nomes":
