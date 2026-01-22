@@ -1,34 +1,54 @@
 """
-Processador de Deslocamentos v3
+Processador de Deslocamentos v5
 ================================
-Versão melhorada com:
+Versão com classificação baseada em VELOCIDADE:
 - Processamento INCREMENTAL (sem DELETE destrutivo)
-- Cálculo de tempo ocioso real
-- Detecção de perda de sinal vs parada intencional
+- Classificação V5: velocidade >= 3 km/h = movimento
+- Consolidação automática de períodos curtos (< 5 min)
+- Tratamento de período "em curso" (não insere se < 30 min)
 - Rastreabilidade com raw_id_inicio e raw_id_fim
 """
 
 import pandas as pd
 import numpy as np
+import logging
 from datetime import datetime
 from functools import lru_cache
 from database import get_connection, get_placeholder, get_pois, migrate_db
 
+# Configurar logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 # Usar apenas a base
 from poi_data import POIS_NUPORANGA, POI_RADIUS
 
-# ==========================================
-# CONFIGURAÇÕES
-# ==========================================
-GAP_THRESHOLD_MINUTES = 20      # Tempo de gap de sinal para considerar nova viagem
-STOP_THRESHOLD_KMH = 3          # Velocidade abaixo = parado (ociosidade)
-MIN_DISTANCIA_VIAGEM = 2        # Viagens < 2km são ruído/manobra
-SIGNAL_LOSS_THRESHOLD = 60      # > 60min sem sinal = provável perda de sinal
-MAX_SPEED_REALISTIC = 150       # Velocidade máxima realista (km/h)
-
-# V4: Novas configurações para lógica baseada em ignição + distância
-TEMPO_IGN_OFF_PARADA = 10       # Minutos com ignição OFF para FECHAR deslocamento
-DIST_REINICIO_DESLOCAMENTO = 3  # km de distância para REINICIAR deslocamento após parada
+# Importar configurações centralizadas (com fallback se não existir)
+try:
+    from config import (
+        VELOCIDADE_MOVIMENTO, MIN_DURACAO_PERIODO, GAP_CONSOLIDACAO,
+        TEMPO_PERIODO_EM_CURSO, GAP_THRESHOLD_MINUTES, STOP_THRESHOLD_KMH,
+        MIN_DISTANCIA_VIAGEM, SIGNAL_LOSS_THRESHOLD, MAX_SPEED_REALISTIC,
+        TEMPO_IGN_OFF_PARADA, DIST_REINICIO_DESLOCAMENTO, BATCH_SIZE
+    )
+except ImportError:
+    # Fallback para valores padrão se config.py não existir
+    VELOCIDADE_MOVIMENTO = 3
+    MIN_DURACAO_PERIODO = 5
+    GAP_CONSOLIDACAO = 15
+    TEMPO_PERIODO_EM_CURSO = 30
+    GAP_THRESHOLD_MINUTES = 20
+    STOP_THRESHOLD_KMH = 3
+    MIN_DISTANCIA_VIAGEM = 2
+    SIGNAL_LOSS_THRESHOLD = 60
+    MAX_SPEED_REALISTIC = 150
+    TEMPO_IGN_OFF_PARADA = 10
+    DIST_REINICIO_DESLOCAMENTO = 3
+    BATCH_SIZE = 50
 
 # ==========================================
 # GEOCODIFICAÇÃO (mantida do original)
@@ -165,6 +185,173 @@ def calcular_tempo_motor_off(trip_df):
         (trip_df['time_diff'].notna())
     ]
     return pontos_off['time_diff'].sum()
+
+
+# ==========================================
+# CLASSIFICADOR V5 - Baseado em Velocidade
+# ==========================================
+# Configurações V5 importadas de config.py
+
+
+def classificar_deslocamentos_v5(df):
+    """
+    Classificador V5 - Lógica baseada em VELOCIDADE com consolidação automática
+    
+    Regras:
+    - MOVIMENTO: velocidade >= 3 km/h
+    - PARADA: velocidade < 3 km/h
+    - Períodos < 5 min são consolidados com o adjacente do mesmo tipo
+    - Gaps de até 15 min de parada dentro de um movimento não fragmentam
+    
+    Returns:
+        Lista de dicionários com os períodos classificados
+    """
+    resultados = []
+    
+    for placa in df['placa'].unique():
+        df_placa = df[df['placa'] == placa].sort_values('data_hora').reset_index(drop=True)
+        
+        if df_placa.empty:
+            continue
+        
+        # Calcular diferenças
+        df_placa['time_diff'] = df_placa['data_hora'].diff().dt.total_seconds() / 60
+        
+        # Classificar cada ponto como movimento ou parada baseado em velocidade
+        df_placa['estado'] = df_placa['velocidade'].apply(
+            lambda v: 'MOVIMENTO' if (v or 0) >= VELOCIDADE_MOVIMENTO else 'PARADA'
+        )
+        
+        # PASSO 1: Criar períodos brutos baseados em mudança de estado
+        periodos_brutos = []
+        estado_atual = None
+        inicio_idx = 0
+        
+        for idx, row in df_placa.iterrows():
+            if estado_atual is None:
+                estado_atual = row['estado']
+                inicio_idx = idx
+            elif row['estado'] != estado_atual:
+                # Mudou de estado - fechar período anterior
+                periodos_brutos.append({
+                    'tipo': estado_atual,
+                    'inicio_idx': inicio_idx,
+                    'fim_idx': idx - 1,
+                    'data_inicio': df_placa.loc[inicio_idx, 'data_hora'],
+                    'data_fim': df_placa.loc[idx - 1, 'data_hora'],
+                })
+                estado_atual = row['estado']
+                inicio_idx = idx
+        
+        # Último período
+        if estado_atual is not None:
+            periodos_brutos.append({
+                'tipo': estado_atual,
+                'inicio_idx': inicio_idx,
+                'fim_idx': len(df_placa) - 1,
+                'data_inicio': df_placa.loc[inicio_idx, 'data_hora'],
+                'data_fim': df_placa.iloc[-1]['data_hora'],
+            })
+        
+        # PASSO 2: Consolidar períodos curtos
+        periodos_consolidados = []
+        
+        for p in periodos_brutos:
+            duracao = (p['data_fim'] - p['data_inicio']).total_seconds() / 60
+            
+            if not periodos_consolidados:
+                periodos_consolidados.append(p)
+                continue
+            
+            ultimo = periodos_consolidados[-1]
+            gap = (p['data_inicio'] - ultimo['data_fim']).total_seconds() / 60
+            
+            # Regra 1: Se período é muito curto (< 5 min), absorver no anterior
+            if duracao < MIN_DURACAO_PERIODO:
+                # Estender o período anterior até o fim deste
+                ultimo['fim_idx'] = p['fim_idx']
+                ultimo['data_fim'] = p['data_fim']
+                continue
+            
+            # Regra 2: Se gap é curto e são do mesmo tipo, consolidar
+            if gap <= GAP_CONSOLIDACAO and ultimo['tipo'] == p['tipo']:
+                ultimo['fim_idx'] = p['fim_idx']
+                ultimo['data_fim'] = p['data_fim']
+                continue
+            
+            # Regra 3: Parada curta entre movimentos (ociosidade em trânsito) - absorver no movimento
+            if (ultimo['tipo'] == 'MOVIMENTO' and p['tipo'] == 'PARADA' and 
+                duracao < GAP_CONSOLIDACAO):
+                # Verificar se o próximo também é movimento
+                # Por agora, mantemos como parada curta (será tratado no próximo loop)
+                pass
+            
+            periodos_consolidados.append(p)
+        
+        # PASSO 3: Segunda passada - consolidar movimentos separados por paradas muito curtas
+        periodos_final = []
+        i = 0
+        while i < len(periodos_consolidados):
+            p = periodos_consolidados[i]
+            
+            if p['tipo'] == 'MOVIMENTO':
+                # Verificar se podemos absorver paradas curtas à frente
+                while i + 2 < len(periodos_consolidados):
+                    parada = periodos_consolidados[i + 1]
+                    prox_mov = periodos_consolidados[i + 2]
+                    
+                    if parada['tipo'] == 'PARADA' and prox_mov['tipo'] == 'MOVIMENTO':
+                        duracao_parada = (parada['data_fim'] - parada['data_inicio']).total_seconds() / 60
+                        
+                        if duracao_parada < GAP_CONSOLIDACAO:
+                            # Absorver parada e próximo movimento
+                            p['fim_idx'] = prox_mov['fim_idx']
+                            p['data_fim'] = prox_mov['data_fim']
+                            i += 2
+                        else:
+                            break
+                    else:
+                        break
+            
+            periodos_final.append(p)
+            i += 1
+        
+        # PASSO 4: Construir resultado final com todas as métricas
+        # Verificar se o último período ainda está "em curso"
+        agora = datetime.now()
+        
+        for idx_p, p in enumerate(periodos_final):
+            inicio_idx = p['inicio_idx']
+            fim_idx = p['fim_idx']
+            
+            data_fim_periodo = df_placa.loc[fim_idx, 'data_hora']
+            
+            # Se é o último período E terminou há menos de 30 min, não inserir (em curso)
+            is_ultimo = (idx_p == len(periodos_final) - 1)
+            tempo_desde_fim = (agora - data_fim_periodo.to_pydatetime().replace(tzinfo=None)).total_seconds() / 60
+            
+            if is_ultimo and tempo_desde_fim < 30:
+                # Período ainda em curso, pular para próxima execução
+                continue
+            
+            resultados.append({
+                'placa': placa,
+                'tipo': 'DESLOCAMENTO' if p['tipo'] == 'MOVIMENTO' else 'PARADA',
+                'inicio_idx': inicio_idx,
+                'fim_idx': fim_idx,
+                'data_inicio': df_placa.loc[inicio_idx, 'data_hora'],
+                'data_fim': df_placa.loc[fim_idx, 'data_hora'],
+                'odo_inicio': df_placa.loc[inicio_idx, 'odometro'],
+                'odo_fim': df_placa.loc[fim_idx, 'odometro'],
+                'raw_id_inicio': df_placa.loc[inicio_idx, 'raw_id'],
+                'raw_id_fim': df_placa.loc[fim_idx, 'raw_id'],
+                'lat_inicio': df_placa.loc[inicio_idx, 'latitude'],
+                'lon_inicio': df_placa.loc[inicio_idx, 'longitude'],
+                'lat_fim': df_placa.loc[fim_idx, 'latitude'],
+                'lon_fim': df_placa.loc[fim_idx, 'longitude'],
+            })
+    
+    return resultados
 
 
 def classificar_deslocamentos_v4(df):
@@ -344,18 +531,19 @@ def obter_ultimo_raw_id_processado():
 
 def processar_deslocamentos(reprocessar_tudo=False):
     """
-    Processador V4 - Baseado em Ignição + Distância
+    Processador V5 - Baseado em Velocidade + Consolidação
     
     Lógica:
-    - DESLOCAMENTO: ignição=1, termina quando ignição=0 por 10+ min
-    - PARADA: inicia com ignição=0, termina quando ignição=1 E dist>=3km
-    - OCIOSIDADE: ignição=1 mas parado - não inicia novo deslocamento
+    - MOVIMENTO: velocidade >= 3 km/h
+    - PARADA: velocidade < 3 km/h
+    - Períodos < 5 min são absorvidos no anterior
+    - Paradas < 15 min entre movimentos são consolidadas
     
     Args:
         reprocessar_tudo: Se True, ignora processamento incremental e reprocessa tudo.
                          CUIDADO: Isso pode criar duplicatas se não limpar antes!
     """
-    print("🚀 Iniciando Processador V4 (Ignição + Distância)...")
+    print("🚀 Iniciando Processador V5 (Velocidade + Consolidação)...")
     
     # Garantir que as novas colunas existam
     try:
@@ -403,9 +591,9 @@ def processar_deslocamentos(reprocessar_tudo=False):
     # Converter data
     df['data_hora'] = pd.to_datetime(df['data_hora'])
     
-    # 2. Usar nova classificação V4 baseada em máquina de estados
-    print("🔄 Classificando períodos com lógica V4...")
-    periodos = classificar_deslocamentos_v4(df)
+    # 2. Usar classificação V5 baseada em velocidade com consolidação
+    print("🔄 Classificando períodos com lógica V5 (velocidade + consolidação)...")
+    periodos = classificar_deslocamentos_v5(df)
     
     print(f"📊 Períodos identificados: {len(periodos)}")
     
@@ -602,7 +790,7 @@ def processar_deslocamentos(reprocessar_tudo=False):
     
     # Resumo final
     print("\n" + "="*50)
-    print("📊 RESUMO DO PROCESSAMENTO V4")
+    print("📊 RESUMO DO PROCESSAMENTO V5")
     print("="*50)
     print(f"  Posições processadas: {len(df)}")
     print(f"  Períodos identificados: {len(periodos)}")
@@ -610,6 +798,183 @@ def processar_deslocamentos(reprocessar_tudo=False):
     print(f"  Paradas inseridas: {len(paradas_to_insert)}")
 
 
+
+
+def consolidar_periodos_consecutivos(tolerancia_minutos=30):
+    """
+    Consolida paradas e movimentos consecutivos do mesmo veículo no mesmo local.
+    
+    Esta função agrupa registros fragmentados que deveriam ser um único período.
+    Por exemplo: vários registros de PARADA de 20-30 minutos consecutivos
+    são consolidados em um único registro de PARADA de várias horas.
+    
+    Args:
+        tolerancia_minutos: Gap máximo entre períodos para considerar como consecutivos (default: 30)
+    
+    Regras de consolidação:
+    - PARADAS consecutivas: mesmo local_inicio, gap < tolerância
+    - MOVIMENTOS consecutivos: local_fim do anterior = local_inicio do próximo, gap < tolerância
+    """
+    print(f"🔄 Iniciando consolidação de períodos consecutivos (tolerância: {tolerancia_minutos} min)...")
+    
+    conn = get_connection()
+    c = conn.cursor()
+    
+    # Buscar deslocamentos pendentes ordenados por placa e data
+    c.execute("""
+        SELECT id, placa, tipo_parada, data_inicio, data_fim, 
+               km_inicial, km_final, distancia, local_inicio, local_fim,
+               tempo, tempo_ocioso, tempo_motor_off, qtd_pontos,
+               raw_id_inicio, raw_id_fim
+        FROM deslocamentos 
+        WHERE status = 'PENDENTE'
+        ORDER BY placa, data_inicio
+    """)
+    
+    registros = c.fetchall()
+    
+    if not registros:
+        print("ℹ️ Nenhum deslocamento pendente para consolidar.")
+        conn.close()
+        return
+    
+    print(f"📦 {len(registros)} registros pendentes encontrados.")
+    
+    # Agrupar por placa
+    registros_por_placa = {}
+    for reg in registros:
+        placa = reg[1]
+        if placa not in registros_por_placa:
+            registros_por_placa[placa] = []
+        registros_por_placa[placa].append({
+            'id': reg[0],
+            'placa': reg[1],
+            'tipo': reg[2],
+            'data_inicio': pd.to_datetime(reg[3]),
+            'data_fim': pd.to_datetime(reg[4]),
+            'km_inicial': reg[5] or 0,
+            'km_final': reg[6] or 0,
+            'distancia': reg[7] or 0,
+            'local_inicio': reg[8],
+            'local_fim': reg[9],
+            'tempo': reg[10] or 0,
+            'tempo_ocioso': reg[11] or 0,
+            'tempo_motor_off': reg[12] or 0,
+            'qtd_pontos': reg[13] or 0,
+            'raw_id_inicio': reg[14],
+            'raw_id_fim': reg[15],
+        })
+    
+    ids_para_deletar = []
+    registros_para_atualizar = []
+    total_consolidados = 0
+    
+    for placa, lista_reg in registros_por_placa.items():
+        if len(lista_reg) < 2:
+            continue
+        
+        i = 0
+        while i < len(lista_reg):
+            reg_atual = lista_reg[i]
+            grupo = [reg_atual]
+            
+            # Buscar consecutivos que podem ser consolidados
+            j = i + 1
+            while j < len(lista_reg):
+                reg_prox = lista_reg[j]
+                
+                # Calcular gap entre fim do atual e início do próximo
+                gap = (reg_prox['data_inicio'] - grupo[-1]['data_fim']).total_seconds() / 60
+                
+                # Verificar se pode consolidar
+                pode_consolidar = False
+                
+                if gap <= tolerancia_minutos:
+                    # Mesmo tipo (PARADA com PARADA, MOVIMENTO com MOVIMENTO)
+                    if reg_atual['tipo'] == reg_prox['tipo']:
+                        if reg_atual['tipo'] == 'PARADA':
+                            # PARADAS: mesmo local de início
+                            if grupo[-1]['local_inicio'] == reg_prox['local_inicio']:
+                                pode_consolidar = True
+                        else:
+                            # MOVIMENTOS: local_fim do anterior = local_inicio do próximo
+                            if grupo[-1]['local_fim'] == reg_prox['local_inicio']:
+                                pode_consolidar = True
+                
+                if pode_consolidar:
+                    grupo.append(reg_prox)
+                    j += 1
+                else:
+                    break
+            
+            # Se temos mais de 1 registro no grupo, consolidar
+            if len(grupo) > 1:
+                primeiro = grupo[0]
+                ultimo = grupo[-1]
+                
+                # Calcular métricas agregadas
+                tempo_total = (ultimo['data_fim'] - primeiro['data_inicio']).total_seconds() / 60
+                distancia_total = sum(r['distancia'] for r in grupo)
+                tempo_ocioso_total = sum(r['tempo_ocioso'] for r in grupo)
+                tempo_motor_off_total = sum(r['tempo_motor_off'] for r in grupo)
+                qtd_pontos_total = sum(r['qtd_pontos'] for r in grupo)
+                
+                # Atualizar o primeiro registro com dados consolidados
+                registros_para_atualizar.append({
+                    'id': primeiro['id'],
+                    'data_fim': ultimo['data_fim'].strftime('%Y-%m-%d %H:%M:%S'),
+                    'km_final': ultimo['km_final'],
+                    'distancia': distancia_total,
+                    'local_fim': ultimo['local_fim'],
+                    'tempo': tempo_total,
+                    'tempo_ocioso': tempo_ocioso_total,
+                    'tempo_motor_off': tempo_motor_off_total,
+                    'qtd_pontos': qtd_pontos_total,
+                    'raw_id_fim': ultimo['raw_id_fim'],
+                })
+                
+                # Marcar os demais para deleção
+                for r in grupo[1:]:
+                    ids_para_deletar.append(r['id'])
+                
+                total_consolidados += len(grupo) - 1
+            
+            i = j
+    
+    # Executar atualizações
+    if registros_para_atualizar:
+        print(f"📝 Atualizando {len(registros_para_atualizar)} registros consolidados...")
+        for reg in registros_para_atualizar:
+            c.execute("""
+                UPDATE deslocamentos 
+                SET data_fim = %s, km_final = %s, distancia = %s, local_fim = %s,
+                    tempo = %s, tempo_ocioso = %s, tempo_motor_off = %s, 
+                    qtd_pontos = %s, raw_id_fim = %s
+                WHERE id = %s
+            """, (
+                reg['data_fim'], reg['km_final'], reg['distancia'], reg['local_fim'],
+                reg['tempo'], reg['tempo_ocioso'], reg['tempo_motor_off'],
+                reg['qtd_pontos'], reg['raw_id_fim'], reg['id']
+            ))
+        conn.commit()
+    
+    # Deletar registros consolidados
+    if ids_para_deletar:
+        print(f"🗑️ Removendo {len(ids_para_deletar)} registros duplicados após consolidação...")
+        # Deletar em lotes para evitar query muito grande
+        BATCH_SIZE = 100
+        for i in range(0, len(ids_para_deletar), BATCH_SIZE):
+            batch_ids = ids_para_deletar[i:i + BATCH_SIZE]
+            placeholders = ', '.join(['%s'] * len(batch_ids))
+            c.execute(f"DELETE FROM deslocamentos WHERE id IN ({placeholders})", batch_ids)
+        conn.commit()
+    
+    conn.close()
+    
+    print(f"\n✅ Consolidação concluída!")
+    print(f"   - Registros consolidados: {total_consolidados}")
+    print(f"   - Registros removidos: {len(ids_para_deletar)}")
+    print(f"   - Registros atualizados: {len(registros_para_atualizar)}")
 
 
 def limpar_e_reprocessar():
@@ -746,26 +1111,47 @@ if __name__ == "__main__":
         
         if comando == "--reprocessar":
             limpar_e_reprocessar()
+            # Consolidar após reprocessar
+            consolidar_periodos_consecutivos()
         elif comando == "--limpar-duplicatas":
             remover_duplicatas()
         elif comando == "--corrigir-nomes":
             corrigir_nomes_locais()
+        elif comando == "--consolidar":
+            # Opção para consolidar manualmente
+            tolerancia = 30  # default
+            if len(sys.argv) > 2:
+                try:
+                    tolerancia = int(sys.argv[2])
+                except ValueError:
+                    print(f"⚠️ Tolerância inválida: {sys.argv[2]}. Usando 30 minutos.")
+            consolidar_periodos_consecutivos(tolerancia)
         elif comando == "--help":
             print("""
-Processador de Deslocamentos v3
+Processador de Deslocamentos v5
 ================================
 Uso: python processor.py [opção]
 
 Opções:
-  (sem opção)           Processamento incremental normal
-  --reprocessar         Limpa pendentes e reprocessa tudo
+  (sem opção)           Processamento incremental normal + consolidação
+  --reprocessar         Limpa pendentes e reprocessa tudo + consolida
+  --consolidar [min]    Consolida paradas/movimentos fragmentados (default: 30 min)
   --limpar-duplicatas   Remove deslocamentos e posições duplicados
   --corrigir-nomes      Corrige nomes de locais verbosos
   --help                Mostra esta ajuda
+
+Lógica V5:
+  - MOVIMENTO: velocidade >= 3 km/h
+  - PARADA: velocidade < 3 km/h
+  - Períodos < 5 min são absorvidos no anterior
+  - Paradas < 15 min entre movimentos não fragmentam
+  - Períodos "em curso" (< 30 min) não são inseridos
             """)
         else:
             print(f"Opção desconhecida: {comando}")
             print("Use --help para ver as opções disponíveis")
     else:
+        # Processamento normal + consolidação automática
         processar_deslocamentos()
+        consolidar_periodos_consecutivos()
 
