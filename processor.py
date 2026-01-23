@@ -668,22 +668,24 @@ def classificar_deslocamentos_v6_persistente(df, estado_atual=None):
                 
                 if current_db_id:
                     # UPDATE registro existente no banco
+                    # CORREÇÃO: Usar prev_end_point para km_final (último ponto do movimento anterior)
                     updates.append({
                         'id': current_db_id,
                         'data_fim': data_fim_anterior,
-                        'km_final': transition_start_point['odometro'], # Aproximado
-                        'local_fim': f"{transition_start_point['latitude']}, {transition_start_point['longitude']}", # Será geocodificado depois
-                        'raw_id_fim': transition_start_point['raw_id']
+                        'km_final': prev_end_point['odometro'],
+                        'local_fim': f"{prev_end_point['latitude']}, {prev_end_point['longitude']}",
+                        'raw_id_fim': prev_end_point['raw_id']
                     })
                 else:
                     # CORREÇÃO V6: Fechar o INSERT anterior que ainda estava aberto
                     # Isso acontece quando há múltiplas transições no mesmo lote
                     if inserts:
                         # Preencher data_fim do último insert com o momento da transição
+                        # CORREÇÃO: Usar prev_end_point para o km correto
                         inserts[-1]['data_fim'] = data_fim_anterior
-                        inserts[-1]['km_final'] = transition_start_point['odometro']
-                        inserts[-1]['local_fim'] = f"{transition_start_point['latitude']}, {transition_start_point['longitude']}"
-                        inserts[-1]['raw_id_fim'] = transition_start_point['raw_id']
+                        inserts[-1]['km_final'] = prev_end_point['odometro']
+                        inserts[-1]['local_fim'] = f"{prev_end_point['latitude']}, {prev_end_point['longitude']}"
+                        inserts[-1]['raw_id_fim'] = prev_end_point['raw_id']
                 
                 # 2. Iniciar novo estado
                 current_state_type = point_type
