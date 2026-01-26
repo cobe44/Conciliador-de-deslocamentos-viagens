@@ -202,6 +202,8 @@ def calcular_metricas_periodo(conn, placa, raw_id_inicio, raw_id_fim):
     """
     Calcula métricas completas de um período buscando os dados brutos.
     
+    IMPORTANTE: Busca apenas posições da placa específica no intervalo de IDs.
+    
     Args:
         conn: Conexão com banco
         placa: Placa do veículo
@@ -212,15 +214,33 @@ def calcular_metricas_periodo(conn, placa, raw_id_inicio, raw_id_fim):
         dict com: distancia, tempo_ocioso, tempo_motor_off, qtd_pontos
     """
     try:
+        # CORREÇÃO: Buscar primeiro as datas dos raw_ids para garantir que pegamos
+        # apenas posições da placa correta no período correto
+        query_datas = """
+            SELECT p.data_hora
+            FROM posicoes_raw p
+            JOIN veiculos v ON p.id_veiculo = v.id_sascar
+            WHERE v.placa = %s AND p.id IN (%s, %s)
+            ORDER BY p.data_hora
+        """
+        df_datas = pd.read_sql(query_datas, conn, params=(placa, raw_id_inicio, raw_id_fim))
+        
+        if df_datas.empty or len(df_datas) < 1:
+            return {'distancia': 0, 'tempo_ocioso': 0, 'tempo_motor_off': 0, 'qtd_pontos': 0}
+        
+        data_inicio = df_datas['data_hora'].min()
+        data_fim = df_datas['data_hora'].max()
+        
+        # Agora buscar TODAS as posições da placa no intervalo de DATA (não de ID)
         query = """
             SELECT p.data_hora, p.velocidade, p.ignicao, p.odometro
             FROM posicoes_raw p
             JOIN veiculos v ON p.id_veiculo = v.id_sascar
             WHERE v.placa = %s
-              AND p.id >= %s AND p.id <= %s
+              AND p.data_hora >= %s AND p.data_hora <= %s
             ORDER BY p.data_hora
         """
-        df = pd.read_sql(query, conn, params=(placa, raw_id_inicio, raw_id_fim))
+        df = pd.read_sql(query, conn, params=(placa, data_inicio, data_fim))
         
         if df.empty:
             return {'distancia': 0, 'tempo_ocioso': 0, 'tempo_motor_off': 0, 'qtd_pontos': 0}
@@ -233,6 +253,10 @@ def calcular_metricas_periodo(conn, placa, raw_id_inicio, raw_id_fim):
         # Calcular time_diff para as métricas de tempo
         df['data_hora'] = pd.to_datetime(df['data_hora'])
         df['time_diff'] = df['data_hora'].diff().dt.total_seconds() / 60
+        
+        # Limitar time_diff a valores razoáveis (máx 60 min entre pontos)
+        # Isso evita que gaps de perda de sinal inflem os tempos
+        df.loc[df['time_diff'] > 60, 'time_diff'] = 0
         
         # Tempo parado (velocidade < limiar)
         parado_mask = df['velocidade'] < STOP_THRESHOLD_KMH
