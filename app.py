@@ -268,7 +268,11 @@ with tab_avisos:
         df_ranking['KM Total'] = df_ranking['km_total'].apply(lambda x: f"{x:,.0f} km")
         df_ranking['Tempo Total'] = df_ranking['tempo_total'].apply(lambda x: f"{x/60:.1f}h")
         df_ranking['Tempo Ocioso'] = df_ranking['tempo_ocioso'].apply(lambda x: f"{x/60:.1f}h")
-        df_ranking['% Ocioso'] = ((df_ranking['tempo_ocioso'] / df_ranking['tempo_total'].replace(0, 1)) * 100).apply(lambda x: f"{x:.1f}%")
+        # Limitar porcentagem entre 0 e 100%
+        df_ranking['% Ocioso'] = df_ranking.apply(
+            lambda row: f"{min(100, max(0, (row['tempo_ocioso'] / max(row['tempo_total'], 1)) * 100)):.1f}%" 
+            if row['tempo_total'] > 0 else "0.0%", axis=1
+        )
         
         st.dataframe(
             df_ranking[['placa', 'viagens', 'KM Total', 'Tempo Total', 'Tempo Ocioso', '% Ocioso']].rename(columns={'placa': 'Placa', 'viagens': 'Viagens'}),
@@ -277,22 +281,6 @@ with tab_avisos:
         )
     else:
         st.info("Nenhum dado de deslocamentos nos últimos 7 dias.")
-    
-    st.divider()
-    
-    # === INSIGHTS AUTOMÁTICOS ===
-    st.markdown("### 💡 Insights")
-    
-    if not df_produtividade.empty and len(df_produtividade) > 0:
-        # Veículo mais produtivo
-        top_veiculo = df_produtividade.iloc[0]
-        st.info(f"🏆 **Veículo mais produtivo:** {top_veiculo['placa']} com {top_veiculo['km_total']:,.0f} km rodados")
-        
-        # Veículo com maior tempo ocioso percentual
-        df_produtividade['pct_ocioso'] = df_produtividade['tempo_ocioso'] / df_produtividade['tempo_total'].replace(0, 1) * 100
-        if df_produtividade['pct_ocioso'].max() > 30:
-            pior = df_produtividade.loc[df_produtividade['pct_ocioso'].idxmax()]
-            st.warning(f"⚠️ **Atenção:** {pior['placa']} tem {pior['pct_ocioso']:.0f}% do tempo com motor ligado parado")
 
 # ========================================
 # TAB 2: ANÁLISE INDIVIDUAL
