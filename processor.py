@@ -950,6 +950,15 @@ def processar_deslocamentos(reprocessar_tudo=False):
                 km_final = ins.get('km_final', ins['km_inicial'])
                 raw_id_fim = ins.get('raw_id_fim', ins['raw_id_inicio'])
                 
+                # VALIDAÇÃO: Garantir que data_fim >= data_inicio (evitar duração negativa)
+                dt_inicio_parsed = pd.to_datetime(ins['data_inicio'])
+                dt_fim_parsed = pd.to_datetime(dt_fim)
+                if dt_fim_parsed < dt_inicio_parsed:
+                    # Inverter se necessário (bug nos dados)
+                    dt_fim, ins['data_inicio'] = ins['data_inicio'], dt_fim
+                    dt_inicio_parsed, dt_fim_parsed = dt_fim_parsed, dt_inicio_parsed
+                    logger.warning(f"Datas invertidas corrigidas para placa {placa}")
+                
                 # CALCULAR MÉTRICAS REAIS: Buscar dados brutos e calcular distância/tempos
                 metricas = calcular_metricas_periodo(conn, placa, ins['raw_id_inicio'], raw_id_fim)
                 distancia = metricas['distancia']
@@ -957,13 +966,8 @@ def processar_deslocamentos(reprocessar_tudo=False):
                 tempo_motor_off = metricas['tempo_motor_off']
                 qtd_pontos = metricas['qtd_pontos']
                 
-                # Calcular tempo total do período (em minutos)
-                try:
-                    dt_inicio = pd.to_datetime(ins['data_inicio'])
-                    dt_fim_calc = pd.to_datetime(dt_fim)
-                    tempo_total = (dt_fim_calc - dt_inicio).total_seconds() / 60
-                except:
-                    tempo_total = 0
+                # Calcular tempo total do período (em minutos) - sempre positivo
+                tempo_total = max(0, (dt_fim_parsed - dt_inicio_parsed).total_seconds() / 60)
                 
                 # GEOCODIFICAÇÃO DIRETA: Converter lat/long para nomes de cidades
                 local_inicio_raw = ins.get('local_inicio', '')
