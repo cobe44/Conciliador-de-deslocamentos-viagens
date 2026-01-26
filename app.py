@@ -133,77 +133,166 @@ intervalo_dias = st.sidebar.slider("Janela de Análise (Dias)", 1, 30, 7)
 
 # --- NAVEGAÇÃO PRINCIPAL ---
 st.header("Navegação")
-tab_overview, tab_fechamento, tab_historico = st.tabs(["🗺️ Visão Geral da Frota", "📋 Fechamento de Viagens", "📚 Histórico & Gestão"])
+tab_avisos, tab_fechamento, tab_historico = st.tabs(["⚠️ Avisos & Insights", "📋 Fechamento de Viagens", "📚 Histórico & Gestão"])
 
 # ========================================
-# TAB 1: VISÃO GERAL DA FROTA
+# TAB 1: AVISOS & INSIGHTS
 # ========================================
-with tab_overview:
-    st.subheader("Última Posição de Todos os Veículos")
+with tab_avisos:
+    st.subheader("⚠️ Avisos & Insights da Frota")
+    st.markdown("Análise automática do histórico de posições e deslocamentos para identificar padrões e anomalias.")
     
-    # Buscar última posição de cada veículo (com cache)
-    df_ultimas = get_ultimas_posicoes()
+    # Buscar dados para análise
+    conn = get_connection()
     
-    if df_ultimas.empty:
-        st.warning("Nenhuma posição GPS encontrada no banco de dados.")
+    # 1. Veículos com muito tempo de motor ligado parado
+    query_ocioso = """
+        SELECT d.placa, 
+               SUM(d.tempo_ocioso) as total_ocioso,
+               SUM(d.tempo) as total_tempo,
+               COUNT(*) as qtd_deslocamentos
+        FROM deslocamentos d
+        WHERE d.data_inicio >= NOW() - INTERVAL '7 days'
+          AND d.tempo_ocioso IS NOT NULL
+        GROUP BY d.placa
+        HAVING SUM(d.tempo_ocioso) > 60
+        ORDER BY total_ocioso DESC
+        LIMIT 10
+    """
+    
+    # 2. Veículos parados há muito tempo (última posição)
+    query_parados = """
+        SELECT DISTINCT ON (v.placa) 
+            v.placa,
+            p.data_hora as ultima_posicao,
+            p.ignicao,
+            EXTRACT(EPOCH FROM (NOW() - p.data_hora))/3600 as horas_parado
+        FROM posicoes_raw p
+        JOIN veiculos v ON p.id_veiculo = v.id_sascar
+        ORDER BY v.placa, p.data_hora DESC
+    """
+    
+    # 3. Produtividade por placa (últimos 7 dias)
+    query_produtividade = """
+        SELECT d.placa,
+               COUNT(CASE WHEN d.tipo_parada = 'MOVIMENTO' THEN 1 END) as viagens,
+               COALESCE(SUM(d.distancia), 0) as km_total,
+               COALESCE(SUM(d.tempo), 0) as tempo_total,
+               COALESCE(SUM(d.tempo_ocioso), 0) as tempo_ocioso,
+               COALESCE(SUM(d.tempo_motor_off), 0) as tempo_motor_off
+        FROM deslocamentos d
+        WHERE d.data_inicio >= NOW() - INTERVAL '7 days'
+        GROUP BY d.placa
+        ORDER BY km_total DESC
+    """
+    
+    try:
+        df_ocioso = pd.read_sql(query_ocioso, conn)
+        df_parados = pd.read_sql(query_parados, conn)
+        df_produtividade = pd.read_sql(query_produtividade, conn)
+    except Exception as e:
+        st.error(f"Erro ao buscar dados: {e}")
+        df_ocioso = pd.DataFrame()
+        df_parados = pd.DataFrame()
+        df_produtividade = pd.DataFrame()
+    
+    conn.close()
+    
+    # === SEÇÃO DE ALERTAS ===
+    st.markdown("### 🚨 Alertas")
+    
+    col_alerta1, col_alerta2, col_alerta3 = st.columns(3)
+    
+    # Alerta: Veículos parados há mais de 24h
+    if not df_parados.empty:
+        parados_24h = df_parados[df_parados['horas_parado'] > 24]
+        with col_alerta1:
+            if len(parados_24h) > 0:
+                st.error(f"🛑 **{len(parados_24h)} veículo(s) parado(s) há +24h**")
+                for _, row in parados_24h.head(5).iterrows():
+                    st.caption(f"• {row['placa']}: {row['horas_parado']:.0f}h sem movimentação")
+            else:
+                st.success("✅ Nenhum veículo parado há mais de 24h")
+    
+    # Alerta: Alto tempo ocioso (motor ligado parado)
+    if not df_ocioso.empty:
+        with col_alerta2:
+            st.warning(f"⏱️ **{len(df_ocioso)} veículo(s) com alto tempo ocioso**")
+            for _, row in df_ocioso.head(5).iterrows():
+                horas_ocioso = row['total_ocioso'] / 60
+                st.caption(f"• {row['placa']}: {horas_ocioso:.1f}h motor ligado parado")
     else:
-        st.info(f"Mostrando {len(df_ultimas)} veículos ativos")
+        with col_alerta2:
+            st.success("✅ Tempo ocioso dentro do normal")
+    
+    # Alerta: Veículos sem deslocamentos recentes
+    if not df_produtividade.empty:
+        sem_km = df_produtividade[df_produtividade['km_total'] == 0]
+        with col_alerta3:
+            if len(sem_km) > 0:
+                st.warning(f"📍 **{len(sem_km)} veículo(s) sem km nos últimos 7 dias**")
+                for placa in sem_km['placa'].head(5):
+                    st.caption(f"• {placa}")
+            else:
+                st.success("✅ Todos os veículos com movimentação")
+    
+    st.divider()
+    
+    # === MÉTRICAS DE PRODUTIVIDADE ===
+    st.markdown("### 📊 Produtividade dos Últimos 7 Dias")
+    
+    if not df_produtividade.empty:
+        # Métricas gerais
+        total_km = df_produtividade['km_total'].sum()
+        total_viagens = df_produtividade['viagens'].sum()
+        total_tempo = df_produtividade['tempo_total'].sum()
+        total_ocioso = df_produtividade['tempo_ocioso'].sum()
         
-        # Criar mapa centrado na média das posições
-        lat_centro = df_ultimas['latitude'].mean()
-        lon_centro = df_ultimas['longitude'].mean()
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
         
-        mapa_geral = folium.Map(location=[lat_centro, lon_centro], zoom_start=7)
+        with col_m1:
+            st.metric("Total KM Rodados", f"{total_km:,.0f} km")
+        with col_m2:
+            st.metric("Total Viagens", f"{total_viagens:,.0f}")
+        with col_m3:
+            horas_rodadas = total_tempo / 60
+            st.metric("Horas Rodadas", f"{horas_rodadas:,.0f}h")
+        with col_m4:
+            horas_ociosas = total_ocioso / 60
+            pct_ocioso = (total_ocioso / total_tempo * 100) if total_tempo > 0 else 0
+            st.metric("Horas Motor Ocioso", f"{horas_ociosas:,.0f}h", delta=f"{pct_ocioso:.1f}%", delta_color="inverse")
         
-        # Adicionar marcador para cada veículo
-        for idx, row in df_ultimas.iterrows():
-            placa_display = row['placa'] if pd.notnull(row['placa']) else f"ID {row['id_veiculo']}"
-            
-            # Determinar cor do marcador baseado em ignição
-            cor = 'green' if row['ignicao'] == 1 else 'red'
-            icone = 'play' if row['ignicao'] == 1 else 'stop'
-            
-            # Formatar hora
-            try:
-                data_hora = pd.to_datetime(row['data_hora'])
-                hora_str = data_hora.strftime('%d/%m %H:%M')
-            except:
-                hora_str = str(row['data_hora'])
-            
-            # Popup com informações
-            popup_html = f"""
-            <b>{placa_display}</b><br>
-            🕐 {hora_str}<br>
-            ⚡ {'Ligado' if row['ignicao'] == 1 else 'Desligado'}<br>
-            🚗 {row['velocidade']:.0f} km/h<br>
-            📍 {row['odometro']:.1f} km
-            """
-            
-            folium.Marker(
-                location=[row['latitude'], row['longitude']],
-                popup=folium.Popup(popup_html, max_width=200),
-                tooltip=placa_display,
-                icon=folium.Icon(color=cor, icon=icone, prefix='fa')
-            ).add_to(mapa_geral)
-        
-        # Renderizar mapa
-        st_folium(mapa_geral, height=600, width=None)
-        
-        # Tabela resumo
-        st.subheader("Resumo das Últimas Posições")
-        df_display = df_ultimas.copy()
-        df_display['Placa'] = df_display.apply(
-            lambda x: x['placa'] if pd.notnull(x['placa']) else f"ID {x['id_veiculo']}", axis=1
-        )
-        df_display['Última Atualização'] = pd.to_datetime(df_display['data_hora']).dt.strftime('%d/%m/%Y %H:%M')
-        df_display['Status'] = df_display['ignicao'].apply(lambda x: '🟢 Ligado' if x == 1 else '🔴 Desligado')
-        df_display['Velocidade'] = df_display['velocidade'].apply(lambda x: f"{x:.0f} km/h")
-        df_display['Odômetro'] = df_display['odometro'].apply(lambda x: f"{x:.1f} km")
+        # Tabela de produtividade por placa
+        st.markdown("#### Ranking por KM Rodados")
+        df_ranking = df_produtividade.copy()
+        df_ranking['KM Total'] = df_ranking['km_total'].apply(lambda x: f"{x:,.0f} km")
+        df_ranking['Tempo Total'] = df_ranking['tempo_total'].apply(lambda x: f"{x/60:.1f}h")
+        df_ranking['Tempo Ocioso'] = df_ranking['tempo_ocioso'].apply(lambda x: f"{x/60:.1f}h")
+        df_ranking['% Ocioso'] = ((df_ranking['tempo_ocioso'] / df_ranking['tempo_total'].replace(0, 1)) * 100).apply(lambda x: f"{x:.1f}%")
         
         st.dataframe(
-            df_display[['Placa', 'Última Atualização', 'Status', 'Velocidade', 'Odômetro']],
-            use_container_width=True
+            df_ranking[['placa', 'viagens', 'KM Total', 'Tempo Total', 'Tempo Ocioso', '% Ocioso']].rename(columns={'placa': 'Placa', 'viagens': 'Viagens'}),
+            use_container_width=True,
+            hide_index=True
         )
+    else:
+        st.info("Nenhum dado de deslocamentos nos últimos 7 dias.")
+    
+    st.divider()
+    
+    # === INSIGHTS AUTOMÁTICOS ===
+    st.markdown("### 💡 Insights")
+    
+    if not df_produtividade.empty and len(df_produtividade) > 0:
+        # Veículo mais produtivo
+        top_veiculo = df_produtividade.iloc[0]
+        st.info(f"🏆 **Veículo mais produtivo:** {top_veiculo['placa']} com {top_veiculo['km_total']:,.0f} km rodados")
+        
+        # Veículo com maior tempo ocioso percentual
+        df_produtividade['pct_ocioso'] = df_produtividade['tempo_ocioso'] / df_produtividade['tempo_total'].replace(0, 1) * 100
+        if df_produtividade['pct_ocioso'].max() > 30:
+            pior = df_produtividade.loc[df_produtividade['pct_ocioso'].idxmax()]
+            st.warning(f"⚠️ **Atenção:** {pior['placa']} tem {pior['pct_ocioso']:.0f}% do tempo com motor ligado parado")
 
 # ========================================
 # TAB 2: ANÁLISE INDIVIDUAL
