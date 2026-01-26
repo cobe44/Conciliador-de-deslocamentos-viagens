@@ -198,6 +198,65 @@ def calcular_tempo_motor_off(trip_df):
     return pontos_off['time_diff'].sum()
 
 
+def calcular_metricas_periodo(conn, placa, raw_id_inicio, raw_id_fim):
+    """
+    Calcula métricas completas de um período buscando os dados brutos.
+    
+    Args:
+        conn: Conexão com banco
+        placa: Placa do veículo
+        raw_id_inicio: ID inicial do período em posicoes_raw
+        raw_id_fim: ID final do período em posicoes_raw
+    
+    Returns:
+        dict com: distancia, tempo_ocioso, tempo_motor_off, qtd_pontos
+    """
+    try:
+        query = """
+            SELECT p.data_hora, p.velocidade, p.ignicao, p.odometro
+            FROM posicoes_raw p
+            JOIN veiculos v ON p.id_veiculo = v.id_sascar
+            WHERE v.placa = %s
+              AND p.id >= %s AND p.id <= %s
+            ORDER BY p.data_hora
+        """
+        df = pd.read_sql(query, conn, params=(placa, raw_id_inicio, raw_id_fim))
+        
+        if df.empty:
+            return {'distancia': 0, 'tempo_ocioso': 0, 'tempo_motor_off': 0, 'qtd_pontos': 0}
+        
+        # Calcular distância pela diferença de odômetro (mais preciso)
+        km_inicial = df['odometro'].iloc[0]
+        km_final = df['odometro'].iloc[-1]
+        distancia = max(0, km_final - km_inicial)  # Evitar negativos
+        
+        # Calcular time_diff para as métricas de tempo
+        df['data_hora'] = pd.to_datetime(df['data_hora'])
+        df['time_diff'] = df['data_hora'].diff().dt.total_seconds() / 60
+        
+        # Tempo parado (velocidade < limiar)
+        parado_mask = df['velocidade'] < STOP_THRESHOLD_KMH
+        tempo_ocioso = df.loc[parado_mask, 'time_diff'].sum()
+        if pd.isna(tempo_ocioso):
+            tempo_ocioso = 0
+        
+        # Tempo com motor desligado (ignição = 0)
+        motor_off_mask = df['ignicao'] == 0
+        tempo_motor_off = df.loc[motor_off_mask, 'time_diff'].sum()
+        if pd.isna(tempo_motor_off):
+            tempo_motor_off = 0
+        
+        return {
+            'distancia': float(distancia),
+            'tempo_ocioso': float(tempo_ocioso),
+            'tempo_motor_off': float(tempo_motor_off),
+            'qtd_pontos': len(df)
+        }
+    except Exception as e:
+        logger.warning(f"Erro ao calcular métricas do período: {e}")
+        return {'distancia': 0, 'tempo_ocioso': 0, 'tempo_motor_off': 0, 'qtd_pontos': 0}
+
+
 # ==========================================
 # CLASSIFICADOR V5 - Baseado em Velocidade
 # ==========================================
@@ -881,26 +940,35 @@ def processar_deslocamentos(reprocessar_tudo=False):
         if inserts:
             total_inserts += len(inserts)
             for ins in inserts:
-                dist = (ins.get('km_final', 0) - ins['km_inicial']) if 'km_final' in ins else 0
-                
                 # Inicia como 'PENDENTE' para aparecer na interface de fechamento
-                # Podemos também usar 'EM_CURSO' se ainda não fechou, mas interface filtra PENDENTE
                 status = 'PENDENTE'
                 
-                # CORREÇÃO V6: Se o registro é EM_CURSO, ele pode não ter data_fim definida ainda no dicionário ins.
+                # CORREÇÃO V6: Se o registro é EM_CURSO, ele pode não ter data_fim definida ainda.
                 # Mas o banco exige NOT NULL. Então usamos a última data conhecida como data_fim provisória.
-                # A lógica V6 vai estender essa data via UPDATE nas próximas execuções.
                 
-                dt_fim = ins.get('data_fim', ins['data_inicio']) # Se não tem fim, fim = inicio (duração 0)
+                dt_fim = ins.get('data_fim', ins['data_inicio'])
                 km_final = ins.get('km_final', ins['km_inicial'])
                 raw_id_fim = ins.get('raw_id_fim', ins['raw_id_inicio'])
                 
+                # CALCULAR MÉTRICAS REAIS: Buscar dados brutos e calcular distância/tempos
+                metricas = calcular_metricas_periodo(conn, placa, ins['raw_id_inicio'], raw_id_fim)
+                distancia = metricas['distancia']
+                tempo_ocioso = metricas['tempo_ocioso']
+                tempo_motor_off = metricas['tempo_motor_off']
+                qtd_pontos = metricas['qtd_pontos']
+                
+                # Calcular tempo total do período (em minutos)
+                try:
+                    dt_inicio = pd.to_datetime(ins['data_inicio'])
+                    dt_fim_calc = pd.to_datetime(dt_fim)
+                    tempo_total = (dt_fim_calc - dt_inicio).total_seconds() / 60
+                except:
+                    tempo_total = 0
+                
                 # GEOCODIFICAÇÃO DIRETA: Converter lat/long para nomes de cidades
-                # O local_inicio e local_fim vêm como "lat, lon" do classificador
                 local_inicio_raw = ins.get('local_inicio', '')
                 local_fim_raw = ins.get('local_fim', ins.get('local_inicio', ''))
                 
-                # Extrair lat/lon e geocodificar
                 try:
                     parts_ini = local_inicio_raw.split(',')
                     if len(parts_ini) == 2:
@@ -926,13 +994,15 @@ def processar_deslocamentos(reprocessar_tudo=False):
                         placa, tipo_parada, data_inicio, data_fim, 
                         km_inicial, km_final, distancia, 
                         local_inicio, local_fim, 
+                        tempo, tempo_ocioso, tempo_motor_off, qtd_pontos,
                         raw_id_inicio, raw_id_fim,
                         status
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
                     placa, ins['tipo'], ins['data_inicio'], dt_fim,
-                    ins['km_inicial'], km_final, dist,
+                    ins['km_inicial'], km_final, distancia,
                     local_inicio, local_fim,
+                    tempo_total, tempo_ocioso, tempo_motor_off, qtd_pontos,
                     ins['raw_id_inicio'], raw_id_fim,
                     status
                 ))
