@@ -250,6 +250,38 @@ if __name__ == "__main__":
         print(f"Erro na manutenção: {e}")
         print("Continuando mesmo assim...")
     
+    # PASSO 2: Sincronizar cadastro de veículos
+    print("\n=== ATUALIZANDO CADASTRO DE VEÍCULOS ===")
+    try:
+        client = SascarClient()
+        xml_veiculos = client.obter_veiculos(quantidade=1000)
+        if xml_veiculos:
+            root = ET.fromstring(xml_veiculos.strip())
+            items = root.findall('.//return')
+            print(f"DEBUG: Encontrados {len(items)} itens no XML de veículos")
+            count_v = 0
+            conn = get_connection()
+            c = conn.cursor()
+            for item in root.findall('.//return'):
+                try:
+                    vid = int(item.find('idVeiculo').text)
+                    placa = item.find('placa').text
+                    if vid and placa:
+                        if IS_POSTGRES:
+                            c.execute("INSERT INTO veiculos (id_sascar, placa) VALUES (%s, %s) ON CONFLICT (id_sascar) DO UPDATE SET placa=EXCLUDED.placa", (vid, placa))
+                        else:
+                            c.execute("INSERT OR REPLACE INTO veiculos (id_sascar, placa) VALUES (?, ?)", (vid, placa))
+                        count_v += 1
+                except:
+                    pass
+            conn.commit()
+            conn.close()
+            print(f"✓ {count_v} veículos sincronizados com sucesso.")
+        else:
+            print("⚠ Não foi possível obter a lista de veículos.")
+    except Exception as e:
+        print(f"Erro ao sincronizar veículos: {e}")
+    
     print("\n" + "="*50 + "\n")
     
     client = SascarClient()
