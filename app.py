@@ -55,21 +55,26 @@ def load_plates():
     return pd.read_sql("SELECT DISTINCT placa FROM veiculos WHERE placa IS NOT NULL ORDER BY placa", engine)['placa'].tolist()
 
 
+@st.cache_data(ttl=60)
 def load_events(placa):
     return pd.read_sql(f"SELECT * FROM deslocamentos WHERE placa = '{placa}' AND validado = FALSE ORDER BY data_inicio", engine)
 
 
+@st.cache_data(ttl=60)
 def load_trips(placa):
     return pd.read_sql(f"SELECT * FROM final_trips WHERE placa = '{placa}' ORDER BY data_inicio DESC", engine)
 
 
+@st.cache_data(ttl=300)
 def load_route(truck_id, t0, t1):
     return pd.read_sql(f"SELECT latitude, longitude FROM posicoes_raw WHERE id_veiculo = {truck_id} AND data_hora BETWEEN '{t0}' AND '{t1}' ORDER BY data_hora", engine)
 
 
 def process_plate(placa, dias=7):
     from processor import process_single
-    return process_single(placa, dias)
+    n = process_single(placa, dias)
+    st.cache_data.clear()
+    return n
 
 
 def save_trip(data, event_ids):
@@ -98,9 +103,13 @@ def save_trip(data, event_ids):
         
         with engine.connect() as conn:
             conn.execute(text(sql))
-            for eid in event_ids:
-                conn.execute(text(f"UPDATE deslocamentos SET validado=TRUE, trip_id='{tid}' WHERE id='{eid}'"))
+            # Use param binding for list? No, explicit loop is safer for now or construct IN clause
+            # Doing explicit update in one go is better but list handling in string is annoying
+            ids_str = "', '".join(event_ids)
+            conn.execute(text(f"UPDATE deslocamentos SET validado=TRUE, trip_id='{tid}' WHERE id IN ('{ids_str}')"))
             conn.commit()
+            
+        st.cache_data.clear()
         return True
     except Exception as e:
         st.error(f"Erro: {e}")
@@ -113,6 +122,7 @@ def delete_trip(tid):
             conn.execute(text(f"UPDATE deslocamentos SET validado=FALSE, trip_id=NULL WHERE trip_id='{tid}'"))
             conn.execute(text(f"DELETE FROM final_trips WHERE id='{tid}'"))
             conn.commit()
+        st.cache_data.clear()
         return True
     except Exception as e:
         st.error(f"Erro: {e}")
