@@ -12,6 +12,35 @@ from functools import lru_cache
 _gdf = None
 _loaded = False
 
+import requests
+import zipfile
+import io
+
+def _download_and_extract(base_dir):
+    """Download and extract IBGE shapefile."""
+    url = "https://geoftp.ibge.gov.br/organizacao_do_territorio/malhas_territoriais/malhas_municipais/municipio_2023/Brasil/BR_Municipios_2023.zip"
+    zip_path = os.path.join(base_dir, '..', 'utils', 'BR_Municipios_2023.zip')
+    extract_path = os.path.join(base_dir, '..', 'utils')
+    
+    # Create utils dir if not exists
+    os.makedirs(extract_path, exist_ok=True)
+    
+    print(f"[IBGE] Downloading map data from IBGE (approx 130MB)...")
+    try:
+        r = requests.get(url, stream=True)
+        r.raise_for_status()
+        with open(zip_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+        print("[IBGE] Download complete. Extracting...")
+        
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_path)
+            
+        print("[IBGE] Extraction complete.")
+    except Exception as e:
+        print(f"[IBGE] Failed to download/extract: {e}")
+
 def _load_shapefile():
     """Load IBGE shapefile on first use."""
     global _gdf, _loaded
@@ -22,12 +51,20 @@ def _load_shapefile():
     try:
         import geopandas as gpd
         
-        # Find shapefile path
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        shapefile_path = os.path.join(current_dir, '..', 'utils', 'BR_Municipios_2024.shp')
+        # Trying 2023 (official link) or 2024 (if local)
+        shapefile_path_23 = os.path.join(current_dir, '..', 'utils', 'BR_Municipios_2023.shp')
+        shapefile_path_24 = os.path.join(current_dir, '..', 'utils', 'BR_Municipios_2024.shp')
         
+        shapefile_path = shapefile_path_24 if os.path.exists(shapefile_path_24) else shapefile_path_23
+        
+        # Download if neither exists
         if not os.path.exists(shapefile_path):
-            print(f"[IBGE] Shapefile not found: {shapefile_path}")
+            _download_and_extract(current_dir)
+            shapefile_path = shapefile_path_23 # Default after download
+            
+        if not os.path.exists(shapefile_path):
+            print(f"[IBGE] Shapefile still not found after download attempt.")
             _loaded = True
             return None
         
