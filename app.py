@@ -1,733 +1,301 @@
+"""
+LOGLIVE Console - Final V2
+===========================
+Fixed: numpy types, origin/destination, motor time format, strict stop logic
+"""
+
 import streamlit as st
 import pandas as pd
-import folium
-from streamlit_folium import st_folium
-import plotly.express as px
-import math
-import io
-import warnings
-from database import get_connection, get_placeholder, execute_insert_returning_id
-from poi_data import POIS_NUPORANGA
-import functools
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import uuid
 
-# Ignorar avisos
-warnings.filterwarnings("ignore")
+st.set_page_config(page_title="LOGLIVE", layout="wide", initial_sidebar_state="expanded")
+st.markdown("<style>.block-container{padding-top:0.5rem!important}#MainMenu,footer,header{visibility:hidden}</style>", unsafe_allow_html=True)
 
-st.set_page_config(page_title="Gestão de Frota", layout="wide")
-st.title("🚛 Gestão de Frota")
+from sqlalchemy import create_engine, text
+from database import DATABASE_URL
+engine = create_engine(DATABASE_URL)
 
-# Funções com cache para melhorar performance
-@st.cache_data(ttl=60)  # Cache por 60 segundos
-def get_veiculos():
-    """Busca lista de veículos com cache"""
-    conn = get_connection()
-    query_v = """
-        SELECT DISTINCT p.id_veiculo, v.placa 
-        FROM posicoes_raw p 
-        LEFT JOIN veiculos v ON p.id_veiculo = v.id_sascar
-        ORDER BY v.placa, p.id_veiculo
-    """
-    df = pd.read_sql(query_v, conn)
-    conn.close()
-    return df
+# Ensure tables
+with engine.connect() as conn:
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS deslocamentos (
+            id VARCHAR(100) PRIMARY KEY, placa VARCHAR(20) NOT NULL, truck_id INTEGER NOT NULL,
+            tipo VARCHAR(20) NOT NULL, data_inicio TIMESTAMP NOT NULL, data_fim TIMESTAMP NOT NULL,
+            duracao_min FLOAT DEFAULT 0, dist_km FLOAT DEFAULT 0, motor_ligado_min FLOAT DEFAULT 0,
+            lat_inicio FLOAT, lon_inicio FLOAT, lat_fim FLOAT, lon_fim FLOAT,
+            local_inicio VARCHAR(100), local_fim VARCHAR(100),
+            validado BOOLEAN DEFAULT FALSE, trip_id VARCHAR(100), 
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+    conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS final_trips (
+            id VARCHAR(100) PRIMARY KEY, placa VARCHAR(20), truck_id INTEGER,
+            data_inicio TIMESTAMP, data_fim TIMESTAMP, origem VARCHAR(100), destino VARCHAR(100),
+            km_total FLOAT DEFAULT 0, tempo_mov_min FLOAT DEFAULT 0, tempo_par_min FLOAT DEFAULT 0,
+            motorista VARCHAR(100), cte VARCHAR(50), valor FLOAT DEFAULT 0,
+            tipo VARCHAR(50) DEFAULT 'Produtiva', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """))
+    conn.commit()
 
-@st.cache_data(ttl=30)  # Cache por 30 segundos
-def get_deslocamentos_pendentes(placa):
-    """Busca deslocamentos pendentes com cache"""
-    conn = get_connection()
-    query = f"""
-        SELECT id, data_inicio, data_fim, km_inicial, km_final, distancia,
-               local_inicio, local_fim, tempo, tempo_ocioso, tempo_motor_off, situacao,
-               COALESCE(tipo_parada, 'MOVIMENTO') as tipo_parada,
-               COALESCE(qtd_pontos, 0) as qtd_pontos
-        FROM deslocamentos 
-        WHERE placa = {get_placeholder(1)} AND status = 'PENDENTE'
-        ORDER BY data_inicio
-    """
-    df = pd.read_sql(query, conn, params=(placa,))
-    conn.close()
-    return df
 
-@st.cache_data(ttl=30)
-def get_placas_pendentes():
-    """Busca placas com deslocamentos pendentes com cache"""
-    conn = get_connection()
-    query = """
-        SELECT DISTINCT placa FROM deslocamentos 
-        WHERE status = 'PENDENTE' 
-        ORDER BY placa
-    """
+def fmt_min(m):
+    """Format minutes as hh:mm"""
+    m = float(m) if m else 0
+    h = int(m // 60)
+    mm = int(m % 60)
+    return f"{h}h{mm:02d}m" if h > 0 else f"{mm}m"
+
+
+@st.cache_data(ttl=300)
+def load_plates():
+    return pd.read_sql("SELECT DISTINCT placa FROM veiculos WHERE placa IS NOT NULL ORDER BY placa", engine)['placa'].tolist()
+
+
+def load_events(placa):
+    return pd.read_sql(f"SELECT * FROM deslocamentos WHERE placa = '{placa}' AND validado = FALSE ORDER BY data_inicio", engine)
+
+
+def load_trips(placa):
+    return pd.read_sql(f"SELECT * FROM final_trips WHERE placa = '{placa}' ORDER BY data_inicio DESC", engine)
+
+
+def load_route(truck_id, t0, t1):
+    return pd.read_sql(f"SELECT latitude, longitude FROM posicoes_raw WHERE id_veiculo = {truck_id} AND data_hora BETWEEN '{t0}' AND '{t1}' ORDER BY data_hora", engine)
+
+
+def process_plate(placa, dias=7):
+    from processor import process_single
+    return process_single(placa, dias)
+
+
+def save_trip(data, event_ids):
     try:
-        placas = pd.read_sql(query, conn)['placa'].tolist()
-    except:
-        placas = []
-    conn.close()
-    return placas
+        tid = str(uuid.uuid4())
+        
+        # Convert numpy types to Python native
+        km = float(data['km']) if hasattr(data['km'], 'item') else float(data['km'])
+        mov = float(data['mov']) if hasattr(data['mov'], 'item') else float(data['mov'])
+        par = float(data['par']) if hasattr(data['par'], 'item') else float(data['par'])
+        val = float(data.get('valor', 0)) if data.get('valor') else 0.0
+        
+        # Escape strings
+        origem = str(data['origem']).replace("'", "''")
+        destino = str(data['destino']).replace("'", "''")
+        motorista = str(data.get('motorista', '')).replace("'", "''")
+        cte = str(data.get('cte', '')).replace("'", "''")
+        tipo = str(data.get('tipo', 'Produtiva'))
+        
+        sql = f"""
+            INSERT INTO final_trips (id, placa, truck_id, data_inicio, data_fim, origem, destino, 
+                km_total, tempo_mov_min, tempo_par_min, motorista, cte, valor, tipo)
+            VALUES ('{tid}', '{data['placa']}', {data['truck_id']}, '{data['t0']}', '{data['t1']}',
+                '{origem}', '{destino}', {km}, {mov}, {par}, '{motorista}', '{cte}', {val}, '{tipo}')
+        """
+        
+        with engine.connect() as conn:
+            conn.execute(text(sql))
+            for eid in event_ids:
+                conn.execute(text(f"UPDATE deslocamentos SET validado=TRUE, trip_id='{tid}' WHERE id='{eid}'"))
+            conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Erro: {e}")
+        return False
 
-@st.cache_data(ttl=60)
-def get_ultimas_posicoes():
-    """Busca últimas posições de todos os veículos com cache"""
-    conn = get_connection()
-    query = """
-        SELECT 
-            p.id_veiculo,
-            v.placa,
-            p.latitude,
-            p.longitude,
-            p.data_hora,
-            p.ignicao,
-            p.velocidade,
-            p.odometro
-        FROM posicoes_raw p
-        LEFT JOIN veiculos v ON p.id_veiculo = v.id_sascar
-        WHERE p.id_veiculo IN (
-            SELECT DISTINCT id_veiculo FROM posicoes_raw
-        )
-        AND p.data_hora = (
-            SELECT MAX(data_hora) 
-            FROM posicoes_raw 
-            WHERE id_veiculo = p.id_veiculo
-        )
-        ORDER BY v.placa, p.id_veiculo
-    """
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
 
-@st.cache_data(ttl=30)
-def get_viagens_historico():
-    """Busca histórico de viagens com cache"""
-    conn = get_connection()
-    query = """
-        SELECT id, placa, data_inicio, data_fim, operacao, rota, num_cte, 
-               valor, valor_km, distancia_total, tipo_viagem, observacao, tempo_parado, tempo_motor_off
-        FROM viagens 
-        ORDER BY data_inicio DESC
-        LIMIT 100
-    """
-    df = pd.read_sql(query, conn)
-    conn.close()
-    return df
+def delete_trip(tid):
+    try:
+        with engine.connect() as conn:
+            conn.execute(text(f"UPDATE deslocamentos SET validado=FALSE, trip_id=NULL WHERE trip_id='{tid}'"))
+            conn.execute(text(f"DELETE FROM final_trips WHERE id='{tid}'"))
+            conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"Erro: {e}")
+        return False
 
-# Carregar veículos
-veiculos_df = get_veiculos()
 
-if veiculos_df.empty:
-    st.error("Nenhum dado de GPS encontrado no banco de dados.")
+# Sidebar
+st.sidebar.title("🚛 LOGLIVE")
+plates = load_plates()
+if not plates:
+    st.warning("Nenhuma placa.")
     st.stop()
 
-# Criar lista para exibição: "Placa (ID)" ou apenas "ID" if not mapped
-veiculos_df['display'] = veiculos_df.apply(
-    lambda x: f"{x['placa']} ({x['id_veiculo']})" if pd.notnull(x['placa']) else f"ID: {x['id_veiculo']} (Não Cadastrado)", 
-    axis=1
-)
+placa = st.sidebar.selectbox("Placa", plates)
+dias = st.sidebar.slider("Dias", 1, 30, 7)
 
-# --- CONFIGURAÇÃO ---
-# (Sem sidebar complexo mais)
+if st.sidebar.button("🔄 Processar"):
+    with st.spinner(f"Processando {placa}..."):
+        n = process_plate(placa, dias)
+        st.sidebar.success(f"✓ {n} eventos")
+        st.rerun()
 
 
-# Configurações padrão (internos, sem controle manual)
-raio_base = 3000
-raio_poi = 1000
-intervalo_dias = st.sidebar.slider("Janela de Análise (Dias)", 1, 30, 7)
+# Tabs
+tab1, tab2 = st.tabs(["📋 Timeline", "🚚 Viagens"])
 
-# --- NAVEGAÇÃO PRINCIPAL ---
-st.header("Navegação")
-tab_avisos, tab_fechamento, tab_historico = st.tabs(["⚠️ Avisos & Insights", "📋 Fechamento de Viagens", "📚 Histórico & Gestão"])
-
-# ========================================
-# TAB 1: AVISOS & INSIGHTS
-# ========================================
-with tab_avisos:
-    st.subheader("⚠️ Avisos & Insights da Frota")
-    st.markdown("Análise automática do histórico de posições e deslocamentos para identificar padrões e anomalias.")
+with tab1:
+    events = load_events(placa)
     
-    # Buscar dados para análise
-    conn = get_connection()
-    
-    # 1. Veículos com muito tempo de motor ligado parado
-    query_ocioso = """
-        SELECT d.placa, 
-               SUM(d.tempo_ocioso) as total_ocioso,
-               SUM(d.tempo) as total_tempo,
-               COUNT(*) as qtd_deslocamentos
-        FROM deslocamentos d
-        WHERE d.data_inicio >= NOW() - INTERVAL '7 days'
-          AND d.tempo_ocioso IS NOT NULL
-        GROUP BY d.placa
-        HAVING SUM(d.tempo_ocioso) > 60
-        ORDER BY total_ocioso DESC
-        LIMIT 10
-    """
-    
-    # 2. Veículos parados há muito tempo (última posição)
-    query_parados = """
-        SELECT DISTINCT ON (v.placa) 
-            v.placa,
-            p.data_hora as ultima_posicao,
-            p.ignicao,
-            EXTRACT(EPOCH FROM (NOW() - p.data_hora))/3600 as horas_parado
-        FROM posicoes_raw p
-        JOIN veiculos v ON p.id_veiculo = v.id_sascar
-        ORDER BY v.placa, p.data_hora DESC
-    """
-    
-    # 3. Produtividade por placa (últimos 7 dias)
-    query_produtividade = """
-        SELECT d.placa,
-               COUNT(CASE WHEN d.tipo_parada = 'MOVIMENTO' THEN 1 END) as viagens,
-               COALESCE(SUM(d.distancia), 0) as km_total,
-               COALESCE(SUM(d.tempo), 0) as tempo_total,
-               COALESCE(SUM(d.tempo_ocioso), 0) as tempo_ocioso,
-               COALESCE(SUM(d.tempo_motor_off), 0) as tempo_motor_off
-        FROM deslocamentos d
-        WHERE d.data_inicio >= NOW() - INTERVAL '7 days'
-        GROUP BY d.placa
-        ORDER BY km_total DESC
-    """
-    
-    try:
-        df_ocioso = pd.read_sql(query_ocioso, conn)
-        df_parados = pd.read_sql(query_parados, conn)
-        df_produtividade = pd.read_sql(query_produtividade, conn)
-    except Exception as e:
-        st.error(f"Erro ao buscar dados: {e}")
-        df_ocioso = pd.DataFrame()
-        df_parados = pd.DataFrame()
-        df_produtividade = pd.DataFrame()
-    
-    conn.close()
-    
-    # === SEÇÃO DE ALERTAS ===
-    st.markdown("### 🚨 Alertas")
-    
-    col_alerta1, col_alerta2, col_alerta3 = st.columns(3)
-    
-    # Alerta: Veículos parados há mais de 24h
-    if not df_parados.empty:
-        parados_24h = df_parados[df_parados['horas_parado'] > 24]
-        with col_alerta1:
-            if len(parados_24h) > 0:
-                st.error(f"🛑 **{len(parados_24h)} veículo(s) parado(s) há +24h**")
-                for _, row in parados_24h.head(5).iterrows():
-                    st.caption(f"• {row['placa']}: {row['horas_parado']:.0f}h sem movimentação")
-            else:
-                st.success("✅ Nenhum veículo parado há mais de 24h")
-    
-    # Alerta: Alto tempo ocioso (motor ligado parado)
-    if not df_ocioso.empty:
-        with col_alerta2:
-            st.warning(f"⏱️ **{len(df_ocioso)} veículo(s) com alto tempo ocioso**")
-            for _, row in df_ocioso.head(5).iterrows():
-                horas_ocioso = row['total_ocioso'] / 60
-                st.caption(f"• {row['placa']}: {horas_ocioso:.1f}h motor ligado parado")
+    if events.empty:
+        st.info(f"Sem eventos. Clique 'Processar' para {placa}.")
     else:
-        with col_alerta2:
-            st.success("✅ Tempo ocioso dentro do normal")
-    
-    # Alerta: Veículos sem deslocamentos recentes
-    if not df_produtividade.empty:
-        sem_km = df_produtividade[df_produtividade['km_total'] == 0]
-        with col_alerta3:
-            if len(sem_km) > 0:
-                st.warning(f"📍 **{len(sem_km)} veículo(s) sem km nos últimos 7 dias**")
-                for placa in sem_km['placa'].head(5):
-                    st.caption(f"• {placa}")
-            else:
-                st.success("✅ Todos os veículos com movimentação")
-    
-    st.divider()
-    
-    # === MÉTRICAS DE PRODUTIVIDADE ===
-    st.markdown("### 📊 Produtividade dos Últimos 7 Dias")
-    
-    if not df_produtividade.empty:
-        # Métricas gerais
-        total_km = df_produtividade['km_total'].sum()
-        total_viagens = df_produtividade['viagens'].sum()
-        total_tempo = df_produtividade['tempo_total'].sum()
-        total_ocioso = df_produtividade['tempo_ocioso'].sum()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Eventos", len(events))
+        c2.metric("KM", f"{events['dist_km'].sum():.1f}")
+        c3.metric("Movimento", len(events[events['tipo']=='DESLOCAMENTO']))
+        c4.metric("Parada", len(events[events['tipo']=='PARADA']))
         
-        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        st.divider()
+        col_tl, col_map = st.columns([6, 4])
         
-        with col_m1:
-            st.metric("Total KM Rodados", f"{total_km:,.0f} km")
-        with col_m2:
-            st.metric("Total Viagens", f"{total_viagens:,.0f}")
-        with col_m3:
-            horas_rodadas = total_tempo / 60
-            st.metric("Horas Rodadas", f"{horas_rodadas:,.0f}h")
-        with col_m4:
-            horas_ociosas = total_ocioso / 60
-            pct_ocioso = (total_ocioso / total_tempo * 100) if total_tempo > 0 else 0
-            st.metric("Horas Motor Ocioso", f"{horas_ociosas:,.0f}h", delta=f"{pct_ocioso:.1f}%", delta_color="inverse")
-        
-        # Tabela de produtividade por placa
-        st.markdown("#### Ranking por KM Rodados")
-        df_ranking = df_produtividade.copy()
-        df_ranking['KM Total'] = df_ranking['km_total'].apply(lambda x: f"{x:,.0f} km")
-        df_ranking['Tempo Total'] = df_ranking['tempo_total'].apply(lambda x: f"{x/60:.1f}h")
-        df_ranking['Tempo Ocioso'] = df_ranking['tempo_ocioso'].apply(lambda x: f"{x/60:.1f}h")
-        # Limitar porcentagem entre 0 e 100%
-        df_ranking['% Ocioso'] = df_ranking.apply(
-            lambda row: f"{min(100, max(0, (row['tempo_ocioso'] / max(row['tempo_total'], 1)) * 100)):.1f}%" 
-            if row['tempo_total'] > 0 else "0.0%", axis=1
-        )
-        
-        st.dataframe(
-            df_ranking[['placa', 'viagens', 'KM Total', 'Tempo Total', 'Tempo Ocioso', '% Ocioso']].rename(columns={'placa': 'Placa', 'viagens': 'Viagens'}),
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("Nenhum dado de deslocamentos nos últimos 7 dias.")
-
-# ========================================
-# TAB 2: ANÁLISE INDIVIDUAL
-# ========================================
-# TAB 3: FECHAMENTO DE VIAGENS
-# ========================================
-with tab_fechamento:
-    st.subheader("📋 Fechamento Manual de Viagens")
-    st.markdown("""
-    Selecione deslocamentos pendentes e agrupe-os em viagens, classificando conforme as regras de negócio.
-    """)
-    
-    # Buscar placas com deslocamentos pendentes (com cache)
-    placas_pendentes = get_placas_pendentes()
-    
-    if not placas_pendentes:
-        st.info("✅ Não há deslocamentos pendentes para processar.")
-        st.markdown("**Dica:** Execute o processador de deslocamentos para identificar novos trechos.")
-        
-        # Botão para executar processador
-        if st.button("🔄 Processar Deslocamentos", key="btn_processar"):
-            with st.spinner("Processando posições brutas..."):
-                try:
-                    from processor import processar_deslocamentos
-                    processar_deslocamentos()
-                    st.success("Processamento concluído! Recarregue a página para ver os resultados.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Erro ao processar: {e}")
-    else:
-        # Seleção de Placa
-        placa_selecionada = st.selectbox(
-            "🚛 Selecione a Placa:",
-            placas_pendentes,
-            key="placa_fechamento"
-        )
-        
-        if placa_selecionada:
-            # Buscar deslocamentos pendentes desta placa (com cache)
-            df_desloc = get_deslocamentos_pendentes(placa_selecionada)
+        with col_tl:
+            st.subheader(f"Timeline: {placa}")
+            df = events.copy()
+            df['Sel'] = False
+            df['Início'] = pd.to_datetime(df['data_inicio']).dt.strftime('%d/%m %H:%M')
+            df['Fim'] = pd.to_datetime(df['data_fim']).dt.strftime('%H:%M')
+            df['Duração'] = df['duracao_min'].apply(fmt_min)
+            df['KM'] = df['dist_km'].apply(lambda x: f"{x:.1f}" if x > 0 else "-")
+            df['Motor'] = df['motor_ligado_min'].apply(fmt_min)
+            df['Tipo'] = df['tipo'].map({'DESLOCAMENTO': 'Movimento', 'PARADA': 'Parada', 'PERDA_SINAL': 'Perda Sinal'})
             
-            if df_desloc.empty:
-                st.warning("Nenhum deslocamento pendente para esta placa.")
-            else:
-                st.markdown(f"**{len(df_desloc)} deslocamentos pendentes**")
-                
-                # Formatar para exibição
-                df_display = df_desloc.copy()
-                df_display['Data Início'] = pd.to_datetime(df_display['data_inicio']).dt.strftime('%d/%m/%Y %H:%M')
-                df_display['Data Fim'] = pd.to_datetime(df_display['data_fim']).dt.strftime('%d/%m/%Y %H:%M')
-                df_display['Distância'] = df_display['distancia'].apply(lambda x: f"{x:.1f} km" if x else "0 km")
-                
-                # Calcular duração real a partir das datas (diferença entre data_fim e data_inicio)
-                def calc_duration(row):
-                    try:
-                        inicio = pd.to_datetime(row['data_inicio'])
-                        fim = pd.to_datetime(row['data_fim'])
-                        diff_minutes = (fim - inicio).total_seconds() / 60
-                        h, m = divmod(int(diff_minutes), 60)
-                        return f"{h:02d}:{m:02d}"
-                    except:
-                        return "00:00"
-                
-                # Formatar tempo ocioso como HH:MM
-                def format_minutes(mins):
-                    if pd.isna(mins) or mins == 0:
-                        return "00:00"
-                    h, m = divmod(int(mins), 60)
-                    return f"{h:02d}:{m:02d}"
-                
-                df_display['Tempo'] = df_desloc.apply(calc_duration, axis=1)
-                df_display['Parado (On)'] = df_display['tempo_ocioso'].apply(format_minutes)
-                df_display['Desligado'] = df_display['tempo_motor_off'].apply(format_minutes) if 'tempo_motor_off' in df_display.columns else "00:00"
-                df_display['Situação'] = df_display['situacao'].apply(lambda x: '⏸ PARADO' if x == 'PARADO' else '▶ MOVIMENTO')
-                
-                # Mapear tipo de parada para ícones
-                tipo_icons = {'MOVIMENTO': '🚗', 'PARADA': '🅿️', 'PERDA_SINAL': '📡', 'RESET_ODOMETRO': '🔄'}
-                df_display['Tipo'] = df_display['tipo_parada'].apply(lambda x: tipo_icons.get(x, '❓') + ' ' + x if pd.notna(x) else '🚗 MOVIMENTO')
-                
-                df_display['Selecionar'] = False
-                
-                # Data editor para seleção (Motor Lig e Off movidos para o final)
-                cols_editor = ['Selecionar', 'Tipo', 'Data Início', 'Data Fim', 'Tempo', 'local_inicio', 'local_fim', 'Distância', 'Parado (On)', 'Desligado']
-                df_edit = st.data_editor(
-                    df_display[cols_editor],
-                    column_config={
-                        "Selecionar": st.column_config.CheckboxColumn("✓", default=False, width="small"),
-                        "Situação": st.column_config.TextColumn("Situação", width="small"),
-                        "Tempo": st.column_config.TextColumn("Duração", width="small"),
-                        "Parado (On)": st.column_config.TextColumn("Motor Lig.", width="small"),
-                        "Desligado": st.column_config.TextColumn("Motor Off", width="small"),
-                        "local_inicio": st.column_config.TextColumn("Local Início", width="medium"),
-                        "local_fim": st.column_config.TextColumn("Local Fim", width="medium"),
-                    },
-                    width="stretch",
-                    key="editor_deslocamentos"
-                )
-                
-                # Obter IDs selecionados
-                selected_mask = df_edit['Selecionar']
-                selected_ids = df_desloc[selected_mask]['id'].tolist()
-                
-                st.divider()
-                
-                # Formulário de Validação
-                if selected_ids:
-                    st.markdown(f"### 📝 Validar {len(selected_ids)} deslocamento(s) selecionado(s)")
-                    
-                    # Calcular totais consolidados
-                    df_selected = df_desloc[df_desloc['id'].isin(selected_ids)]
-                    data_inicio_viagem = df_selected['data_inicio'].min()
-                    data_fim_viagem = df_selected['data_fim'].max()
-                    
-                    # CORREÇÃO: Usar subtração do odômetro (último - primeiro) para precisão
-                    km_primeiro = float(df_selected['km_inicial'].min())
-                    km_ultimo = float(df_selected['km_final'].max())
-                    distancia_total = km_ultimo - km_primeiro
-                    
-                    # Fallback se odômetro inválido (reset, erro, etc)
-                    if distancia_total <= 0:
-                        distancia_total = float(df_selected['distancia'].sum())
-                        st.warning("⚠️ Distância calculada pela soma dos trechos (odômetro inválido)")
-                    
-                    # Calcular tempo total como diferença entre fim e início (inclui gaps)
-                    inicio_dt = pd.to_datetime(data_inicio_viagem)
-                    fim_dt = pd.to_datetime(data_fim_viagem)
-                    tempo_total = (fim_dt - inicio_dt).total_seconds() / 60  # Em minutos
-                    
-                    tempo_parado = float(df_selected['tempo_ocioso'].sum()) if 'tempo_ocioso' in df_selected.columns else 0.0
-                    tempo_off = float(df_selected['tempo_motor_off'].sum()) if 'tempo_motor_off' in df_selected.columns else 0.0
-                    
-                    # Formatar tempos
-                    def fmt_hhmm(mins):
-                        h, m = divmod(int(mins), 60)
-                        return f"{h:02d}:{m:02d}"
-                    
-                    # Mostrar resumo
-                    col_res1, col_res2, col_res3, col_res4, col_res5 = st.columns(5)
-                    with col_res1:
-                        # Usar HTML para fonte menor
-                        data_ini_str = pd.to_datetime(data_inicio_viagem).strftime('%d/%m %H:%M')
-                        data_fim_str = pd.to_datetime(data_fim_viagem).strftime('%d/%m %H:%M')
-                        st.markdown(f"""
-                        <div style="font-size: 0.8rem; margin-bottom: 5px; color: #666;">Período</div>
-                        <div style="font-size: 0.9rem; font-weight: 600;">{data_ini_str} <br> {data_fim_str}</div>
-                        """, unsafe_allow_html=True)
-                    with col_res2:
-                        st.metric("Tempo Total", fmt_hhmm(tempo_total))
-                    with col_res3:
-                        st.metric("Motor Ligado (Parado)", fmt_hhmm(tempo_parado))
-                        st.caption(f"Desligado: {fmt_hhmm(tempo_off)}")
-                    with col_res4:
-                        st.metric("Distância", f"{distancia_total:.1f} km")
-                    with col_res5:
-                        st.metric("Trechos", str(len(selected_ids)))
-                    
-                    
-                    # --- Gestão de CTEs (Helper Dinâmico) ---
-                    st.markdown("##### 📄 Documentos Fiscais (CTEs)")
-                    if 'ctes' not in st.session_state: st.session_state.ctes = []
-
-                    def add_cte():
-                        num = st.session_state.get('new_cte_num', '').strip()
-                        val_str = st.session_state.get('new_cte_val', 0.0)
-                        
-                        try:
-                            val = float(val_str)
-                        except:
-                            val = 0.0
-                            
-                        if num and val > 0:
-                            # Verificar duplicidade
-                            if not any(c['numero'] == num for c in st.session_state.ctes):
-                                st.session_state.ctes.append({'numero': num, 'valor': val})
-                            st.session_state.new_cte_num = "" # Limpar input
-                            st.session_state.new_cte_val = 0.0
-
-                    c_cte1, c_cte2, c_cte3 = st.columns([2, 1, 1])
-                    c_cte1.text_input("Número CTE", key="new_cte_num", placeholder="Ex: 1234")
-                    c_cte2.number_input("Valor (R$)", min_value=0.0, step=100.0, key="new_cte_val")
-                    c_cte3.button("➕ Add", on_click=add_cte, use_container_width=True)
-
-                    # Listar
-                    if st.session_state.ctes:
-                        st.caption("CTEs incluídos:")
-                        # Chips removíveis
-                        cols = st.columns(3)
-                        for i, item in enumerate(st.session_state.ctes):
-                            label = f"📄 {item['numero']} (R$ {item['valor']:.2f})"
-                            if cols[i % 3].button(f"🗑️ {label}", key=f"del_cte_{i}", help="Clique para remover"):
-                                st.session_state.ctes.pop(i)
-                                st.rerun()
-                    else:
-                        st.info("Nenhum CTE informado.")
-
-                    with st.form("form_viagem"):
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            operacao = st.selectbox(
-                                "Operação *",
-                                ["Ovos - Tatui", "Frango - Passos", "Pintos - Ipigua", 
-                                 "Ovos - Nuporanga", "Pintos - Nuporanga", "Apoio", "Ovos - Nova Mutum"],
-                                key="operacao"
-                            )
-                            
-                            rota = st.text_input("Rota", placeholder="Ex: Base > Granja X > Base", key="rota")
-                            
-                            # Campo de CTE agora reflete a lista (Apenas números para salvar)
-                            cte_lista = [c['numero'] for c in st.session_state.ctes]
-                            cte_str = ", ".join(cte_lista)
-                            num_cte = st.text_input("CTEs", value=cte_str, disabled=True, key="cte_final_display")
-                        
-                        with col2:
-                            # Calcular totais dos CTEs
-                            total_ctes = sum(c['valor'] for c in st.session_state.ctes)
-                            
-                            # Calcular Valor por KM
-                            valor_km_calc = total_ctes / distancia_total if distancia_total > 0 else 0.0
-                            
-                            st.metric("Valor Total (CTEs)", f"R$ {total_ctes:.2f}")
-                            st.metric("Valor por KM", f"R$ {valor_km_calc:.2f}/km")
-                            
-                            st.caption(f"ℹ️ O valor por km é calculado automaticamente baseado na distância ({distancia_total:.1f} km).")
-                            
-                            tipo_viagem = st.radio(
-                                "Tipo de Viagem *",
-                                ["PRODUTIVA", "IMPRODUTIVA"],
-                                horizontal=True,
-                                key="tipo_viagem"
-                            )
-                            
-                            if tipo_viagem == "IMPRODUTIVA":
-                                motivo_improd = st.selectbox(
-                                    "Motivo",
-                                    ["Manutenção", "Vazio", "Desvio", "Outro"],
-                                    key="motivo_improd"
-                                )
-                        
-                        observacao = st.text_area("Observação", placeholder="Observações adicionais...", key="obs")
-                        
-                        col_btn1, col_btn2 = st.columns(2)
-                        
-                        with col_btn1:
-                            submitted = st.form_submit_button("✅ Confirmar Viagem", use_container_width=True, type="primary")
-                        
-                        with col_btn2:
-                            marcar_improd = st.form_submit_button("⚠️ Marcar como Improdutivo", use_container_width=True)
-                    
-                    # Processar confirmação
-                    if submitted:
-                        try:
-                            conn = get_connection()
-                            c = conn.cursor()
-                            
-                            # Construir rota automática se não preenchida
-                            if not rota:
-                                locais = df_selected['local_inicio'].tolist() + [df_selected['local_fim'].iloc[-1]]
-                                rota = " > ".join([l for l in locais if l and l != "Em Trânsito"])
-                            
-                            # Observação com motivo se improdutiva
-                            obs_final = observacao
-                            if tipo_viagem == "IMPRODUTIVA" and 'motivo_improd' in dir():
-                                obs_final = f"[{motivo_improd}] {observacao}".strip()
-                            
-                            # Calcular valor final (Soma dos CTEs)
-                            valor_final = sum(c['valor'] for c in st.session_state.ctes)
-                            # Calcular Valor KM (para salvar no banco)
-                            valor_km_final = valor_final / distancia_total if distancia_total > 0 else 0.0
-
-                            # Inserir viagem
-                            ph_ins = get_placeholder(14)
-                            sql_ins = f"""
-                                INSERT INTO viagens 
-                                (placa, data_inicio, data_fim, tempo_total, tempo_parado, tempo_motor_off, operacao, rota, num_cte, valor, valor_km, distancia_total, tipo_viagem, observacao)
-                                VALUES ({ph_ins})
-                            """
-                            params_ins = (
-                                placa_selecionada,
-                                str(data_inicio_viagem) if hasattr(data_inicio_viagem, 'isoformat') else data_inicio_viagem,
-                                str(data_fim_viagem) if hasattr(data_fim_viagem, 'isoformat') else data_fim_viagem,
-                                float(tempo_total),
-                                float(tempo_parado),
-                                float(tempo_off),
-                                operacao,
-                                rota,
-                                num_cte,
-                                valor_final,
-                                float(valor_km_final),
-                                float(distancia_total),
-                                tipo_viagem,
-                                obs_final
-                            )
-                            
-                            # Obter ID da viagem recém criada
-                            viagem_id = execute_insert_returning_id(c, sql_ins, params_ins)
-                            
-                            # Atualizar status e viagem_id dos deslocamentos
-                            ph_vid = get_placeholder(1)
-                            ph_ids = get_placeholder(len(selected_ids))
-                            c.execute(f"UPDATE deslocamentos SET status = 'PROCESSADO', viagem_id = {ph_vid} WHERE id IN ({ph_ids})", [viagem_id] + selected_ids)
-                            
-                            conn.commit()
-                            conn.close()
-                            
-                            st.success(f"✅ Viagem registrada com sucesso! {len(selected_ids)} deslocamentos processados.")
-                            
-                            # Limpar lista de CTEs
-                            if 'ctes' in st.session_state:
-                                del st.session_state.ctes
-                            
-                            # Limpar cache e recarregar
-                            st.cache_data.clear()
-                            st.rerun()
-                            
-                        except Exception as e:
-                            st.error(f"Erro ao salvar viagem: {e}")
-                    
-                    # Processar marcação como improdutivo (individual ou múltiplo)
-                    if marcar_improd:
-                        try:
-                            conn = get_connection()
-                            c = conn.cursor()
-                            
-                            # Criar viagens individuais para cada deslocamento como improdutivo
-                            for _, row in df_selected.iterrows():
-                                tempo_desloc = float(row.get('tempo', 0)) if 'tempo' in row else 0.0
-                                tempo_parado_desloc = float(row.get('tempo_ocioso', 0)) if 'tempo_ocioso' in row else 0.0
-                                sql_imp = f"""
-                                    INSERT INTO viagens 
-                                    (placa, data_inicio, data_fim, tempo_total, tempo_parado, operacao, rota, num_cte, valor, distancia_total, tipo_viagem, observacao)
-                                    VALUES ({get_placeholder(12)})
-                                """
-                                params_imp = (
-                                    placa_selecionada,
-                                    str(row['data_inicio']) if hasattr(row['data_inicio'], 'isoformat') else row['data_inicio'],
-                                    str(row['data_fim']) if hasattr(row['data_fim'], 'isoformat') else row['data_fim'],
-                                    float(tempo_desloc),
-                                    float(tempo_parado_desloc),
-                                    "Apoio",
-                                    f"{row['local_inicio']} > {row['local_fim']}",
-                                    "",
-                                    0.0,
-                                    float(row['distancia']) if row['distancia'] else 0.0,
-                                    "IMPRODUTIVA",
-                                    observacao if observacao else "Marcado como improdutivo"
-                                )
-                                
-                                # Obter ID da viagem e vincular ao deslocamento
-                                viagem_id = execute_insert_returning_id(c, sql_imp, params_imp)
-                                ph_u = get_placeholder(1)
-                                c.execute(f"UPDATE deslocamentos SET status = 'PROCESSADO', viagem_id = {ph_u} WHERE id = {ph_u}", (viagem_id, row['id']))
-                            
-                            conn.commit()
-                            conn.close()
-                            
-                            st.success(f"⚠️ {len(selected_ids)} deslocamento(s) marcado(s) como improdutivo(s).")
-                            # Limpar cache e recarregar
-                            st.cache_data.clear()
-                            st.rerun()
-                            
-                        except Exception as e:
-                            st.error(f"Erro ao marcar como improdutivo: {e}")
-                
-                else:
-                    st.info("👆 Selecione um ou mais deslocamentos acima para criar uma viagem.")
-        
-        # Histórico movido para tab própria
-        
-# ========================================
-# TAB 3: HISTÓRICO & GESTÃO
-# ========================================
-with tab_historico:
-    st.subheader("📚 Histórico de Viagens")
-    st.markdown("Visualize as viagens fechadas e exclua se necessário (deslocamentos voltam a ser Pendentes).")
-    
-    # Seção de Exclusão
-    with st.expander("🗑️ Excluir Viagem", expanded=False):
-        col_del1, col_del2 = st.columns([1, 2])
-        with col_del1:
-            v_id_del = st.number_input("ID da Viagem para excluir", min_value=1, step=1)
-        with col_del2:
-            st.write("") # Spacer
-            st.write("")
-            if st.button("⚠️ Excluir Viagem e Liberar Deslocamentos"):
-                conn = get_connection()
-                c = conn.cursor()
-                # Verificar se existe
-                ph_ex = get_placeholder(1)
-                c.execute(f"SELECT id FROM viagens WHERE id = {ph_ex}", (v_id_del,))
-                if not c.fetchone():
-                    st.error(f"Viagem {v_id_del} não encontrada.")
-                    conn.close()
-                else:
-                    try:
-                        # 1. Liberar deslocamentos
-                        c.execute(f"UPDATE deslocamentos SET status='PENDENTE', viagem_id=NULL WHERE viagem_id = {ph_ex}", (v_id_del,))
-                        qtd_liberada = c.rowcount
-                        
-                        # 2. Excluir viagem
-                        c.execute(f"DELETE FROM viagens WHERE id = {ph_ex}", (v_id_del,))
-                        conn.commit()
-                        st.success(f"✅ Viagem {v_id_del} excluída! {qtd_liberada} deslocamentos voltaram para 'PENDENTE'.")
-                        # Limpar cache e recarregar
-                        st.cache_data.clear()
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Erro ao excluir: {e}")
-                    finally:
-                        conn.close()
-    
-    st.divider()
-    
-    # Listagem (com cache)
-    try:
-        df_viagens = get_viagens_historico()
-        
-        if df_viagens.empty:
-            st.info("Nenhuma viagem registrada ainda.")
-        else:
-            df_viagens['Data Início'] = pd.to_datetime(df_viagens['data_inicio']).dt.strftime('%d/%m/%Y %H:%M')
-            df_viagens['Data Fim'] = pd.to_datetime(df_viagens['data_fim']).dt.strftime('%d/%m/%Y %H:%M')
-            df_viagens['Valor'] = df_viagens['valor'].apply(lambda x: f"R$ {x:.2f}" if x else "-")
-            df_viagens['R$/KM'] = df_viagens['valor_km'].apply(lambda x: f"R$ {x:.2f}" if x and x > 0 else "-")
-            df_viagens['Distância'] = df_viagens['distancia_total'].apply(lambda x: f"{x:.1f} km" if x else "-")
+            # Handle missing columns gracefully
+            if 'local_inicio' not in df.columns:
+                df['local_inicio'] = df.get('local_nome', '-')
+            if 'local_fim' not in df.columns:
+                df['local_fim'] = df.get('local_nome', '-')
             
-            def fmt_hhmm(mins):
-                if pd.isna(mins) or mins == 0: return "-"
-                h, m = divmod(int(mins), 60)
-                return f"{h:02d}:{m:02d}"
-            
-            df_viagens['Tempo Parado'] = df_viagens['tempo_parado'].apply(fmt_hhmm)
-            df_viagens['Motor Off'] = df_viagens['tempo_motor_off'].apply(fmt_hhmm) if 'tempo_motor_off' in df_viagens.columns else "-"
-            
-            # Colorir por tipo
-            def highlight_tipo(row):
-                if row['tipo_viagem'] == 'PRODUTIVA':
-                    return ['background-color: #d4edda'] * len(row)
-                else:
-                    return ['background-color: #f8d7da'] * len(row)
-            
-            cols_viagens = ['id', 'placa', 'Data Início', 'Data Fim', 'operacao', 'rota', 'Distância', 'Tempo Parado', 'Motor Off', 'Valor', 'R$/KM', 'tipo_viagem', 'observacao']
-
-            st.dataframe(
-                df_viagens[cols_viagens].style.apply(highlight_tipo, axis=1),
-                use_container_width=True,
-                hide_index=True
+            edited = st.data_editor(
+                df[['Sel', 'Tipo', 'Início', 'Fim', 'Duração', 'KM', 'Motor', 'local_inicio', 'local_fim']],
+                column_config={
+                    "Sel": st.column_config.CheckboxColumn("✓", width="small"),
+                    "local_inicio": "Origem",
+                    "local_fim": "Destino"
+                },
+                use_container_width=True, hide_index=True, height=350
             )
-    except Exception as e:
-        st.error(f"Erro ao carregar histórico: {e}")
+            
+            sel = events.iloc[edited[edited['Sel']].index.tolist()] if (edited['Sel']==True).any() else pd.DataFrame()
+        
+        with col_map:
+            st.subheader("Mapa")
+            if sel.empty:
+                st.info("Selecione eventos")
+            else:
+                truck_id = int(sel.iloc[0]['truck_id'])
+                t0 = pd.to_datetime(sel['data_inicio']).min()
+                t1 = pd.to_datetime(sel['data_fim']).max()
+                
+                fig = go.Figure()
+                
+                if (sel['tipo'] == 'PARADA').all():
+                    # Get lat/lon - handle both old and new schema
+                    if 'lat_inicio' in sel.columns:
+                        lat, lon = sel.iloc[0]['lat_inicio'], sel.iloc[0]['lon_inicio']
+                    else:
+                        lat, lon = sel.iloc[0].get('lat', -20.5), sel.iloc[0].get('lon', -47.0)
+                    
+                    local = sel.iloc[0].get('local_inicio', sel.iloc[0].get('local_nome', 'Parada'))
+                    fig.add_trace(go.Scattermapbox(mode="markers", lat=[lat], lon=[lon], 
+                        marker={'size': 20, 'color': '#FFC107'}, text=[local]))
+                    clat, clon, zoom = lat, lon, 14
+                else:
+                    route = load_route(truck_id, t0, t1)
+                    if not route.empty:
+                        fig.add_trace(go.Scattermapbox(mode="lines", lat=route['latitude'], lon=route['longitude'],
+                            line={'width': 3, 'color': '#E53935'}))
+                        fig.add_trace(go.Scattermapbox(mode="markers", lat=[route.iloc[0]['latitude']], 
+                            lon=[route.iloc[0]['longitude']], marker={'size': 12, 'color': '#4CAF50'}))
+                        fig.add_trace(go.Scattermapbox(mode="markers", lat=[route.iloc[-1]['latitude']], 
+                            lon=[route.iloc[-1]['longitude']], marker={'size': 12, 'color': '#E53935'}))
+                        clat = (route['latitude'].min() + route['latitude'].max()) / 2
+                        clon = (route['longitude'].min() + route['longitude'].max()) / 2
+                        rng = max(route['latitude'].max()-route['latitude'].min(), route['longitude'].max()-route['longitude'].min())
+                        zoom = 5 if rng > 5 else 6 if rng > 2 else 7 if rng > 1 else 8 if rng > 0.5 else 10
+                    else:
+                        clat, clon, zoom = -20.5, -47.0, 8
+                
+                fig.update_layout(mapbox_style="open-street-map", 
+                    mapbox=dict(center=dict(lat=clat, lon=clon), zoom=zoom),
+                    margin={"r":0,"t":0,"l":0,"b":0}, height=300, showlegend=False)
+                st.plotly_chart(fig, use_container_width=True)
+        
+        st.divider()
+        st.subheader("📝 Compor Viagem")
+        
+        if sel.empty:
+            st.info("Selecione eventos")
+        else:
+            km = float(sel['dist_km'].sum())
+            t0 = pd.to_datetime(sel['data_inicio']).min()
+            t1 = pd.to_datetime(sel['data_fim']).max()
+            
+            # Get origin/destination
+            if 'local_inicio' in sel.columns:
+                origem = sel.iloc[0]['local_inicio']
+                destino = sel.iloc[-1]['local_fim']
+            else:
+                origem = sel.iloc[0].get('local_nome', '-')
+                destino = sel.iloc[-1].get('local_nome', '-')
+            
+            mov = float(sel[sel['tipo']=='DESLOCAMENTO']['duracao_min'].sum())
+            par = float(sel[sel['tipo']=='PARADA']['duracao_min'].sum())
+            
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Eventos", len(sel))
+            c2.metric("KM", f"{km:.1f}")
+            c3.metric("Movimento", fmt_min(mov))
+            c4.metric("Parado", fmt_min(par))
+            
+            st.markdown(f"**{origem}** → **{destino}**")
+            
+            with st.form("trip"):
+                tipo = st.selectbox("Tipo", ["Produtiva", "Improdutiva", "Reposicionamento"])
+                
+                if tipo == "Produtiva":
+                    motorista = st.text_input("Motorista")
+                    cte = st.text_input("CT-e")
+                    valor = st.number_input("Valor (R$)", min_value=0.0)
+                else:
+                    motorista, cte, valor = "", "", 0.0
+                    if tipo == "Reposicionamento":
+                        st.info("⚠️ Viagem de reposicionamento (sem frete)")
+                
+                if st.form_submit_button("✅ Salvar", type="primary"):
+                    data = {'placa': placa, 'truck_id': int(sel.iloc[0]['truck_id']),
+                            't0': t0, 't1': t1, 'origem': origem, 'destino': destino,
+                            'km': km, 'mov': mov, 'par': par,
+                            'motorista': motorista, 'cte': cte, 'valor': valor, 'tipo': tipo}
+                    if save_trip(data, sel['id'].tolist()):
+                        st.success("✅ Salvo!")
+                        st.rerun()
+
+with tab2:
+    st.subheader("🚚 Viagens")
+    trips = load_trips(placa)
+    
+    if trips.empty:
+        st.info("Nenhuma viagem.")
+    else:
+        for _, t in trips.iterrows():
+            with st.expander(f"{t['origem']} → {t['destino']} | {t['km_total']:.0f} km | {t['tipo']}"):
+                c1, c2, c3 = st.columns(3)
+                c1.write(f"**Início:** {t['data_inicio']}")
+                c1.write(f"**Fim:** {t['data_fim']}")
+                c2.write(f"**Tipo:** {t['tipo']}")
+                c2.write(f"**Motorista:** {t['motorista'] or '-'}")
+                c3.write(f"**CT-e:** {t['cte'] or '-'}")
+                c3.write(f"**Valor:** R$ {t['valor']:.2f}" if t['valor'] else "")
+                
+                if st.button("🗑️ Excluir", key=f"del_{t['id']}"):
+                    if delete_trip(t['id']):
+                        st.success("Excluída!")
+                        st.rerun()
+
+st.caption(f"LOGLIVE | {placa}")
