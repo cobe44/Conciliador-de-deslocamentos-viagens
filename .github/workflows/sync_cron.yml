@@ -2,10 +2,8 @@ name: Sincronização Automática Sascar
 
 on:
   schedule:
-    # Rodar a cada 10 minutos
     - cron: '*/10 * * * *'
   workflow_dispatch:
-    # Permite rodar manualmente pelo botão no GitHub
 
 jobs:
   sync_and_process:
@@ -37,4 +35,4 @@ jobs:
     - name: ⚙️ Rodar Processador de Viagens
       env:
         DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      run: python processor.py
+      run: python processor.py --incremental
