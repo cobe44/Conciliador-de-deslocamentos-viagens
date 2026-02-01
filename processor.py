@@ -32,8 +32,18 @@ try:
 except ImportError:
     HAS_IBGE = False
 
+try:
+    from services.poi_data import get_poi
+    HAS_POIS = True
+except ImportError:
+    HAS_POIS = False
+
 
 def get_city(lat, lon):
+    if HAS_POIS:
+        poi = get_poi(lat, lon)
+        if poi: return poi
+        
     if HAS_IBGE:
         return get_municipio_ibge(lat, lon)
     return f"({lat:.4f}, {lon:.4f})"
