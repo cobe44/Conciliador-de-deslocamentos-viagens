@@ -1,282 +1,106 @@
-import sqlite3
+"""
+LOGLIVE - Database connection layer (Supabase/PostgreSQL)
+=========================================================
+Provides get_connection, get_placeholder, IS_POSTGRES for sascar_sync and app.
+"""
+
 import os
-import sys
+from contextlib import contextmanager
+from urllib.parse import unquote
 
-# Tentar carregar variáveis de ambiente localmente
+from dotenv import load_dotenv
+
+load_dotenv()
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
+
+# Use psycopg2 for raw cursor (sascar_sync, app)
 try:
-    from dotenv import load_dotenv
-    load_dotenv()
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    HAS_PSYCOPG2 = True
 except ImportError:
-    pass
+    HAS_PSYCOPG2 = False
 
-# Tentar carregar secrets do Streamlit Cloud
-def get_database_url():
-    """Obtém a URL do banco de dados de várias fontes possíveis"""
-    # 1. Tentar Streamlit secrets primeiro (para Streamlit Cloud)
-    try:
-        import streamlit as st
-        if hasattr(st, 'secrets'):
-            # Tentar DATABASE_URL direto
-            if 'DATABASE_URL' in st.secrets:
-                return st.secrets['DATABASE_URL']
-            # Tentar componentes separados
-            if 'database' in st.secrets:
-                db = st.secrets['database']
-                # Codificar @ na senha como %40
-                from urllib.parse import quote_plus
-                password = quote_plus(db.get('password', ''))
-                return f"postgresql://{db['user']}:{password}@{db['host']}:{db['port']}/{db['database']}"
-    except Exception:
-        pass
+IS_POSTGRES = True
+
+
+def _parse_url(url):
+    """Parse postgresql://user:pass@host:port/db into components for psycopg2."""
+    if not url:
+        return {}
     
-    # 2. Variável de ambiente
-    return os.getenv("DATABASE_URL")
+    # Handle quoted strings just in case
+    url = url.strip('"\'')
+    
+    if not url.startswith("postgresql://"):
+        return {}
+        
+    url = url.replace("postgresql://", "")
+    if "@" in url:
+        auth, rest = url.split("@", 1)
+        user, _, password = auth.partition(":")
+        # URL decode user and password to handle special chars (e.g. %40 -> @)
+        user = unquote(user)
+        password = unquote(password)
+        host_part = rest
+    else:
+        user, password = "", ""
+        host_part = url
+    if "/" in host_part:
+        host_port, db = host_part.rsplit("/", 1)
+        db = db.split("?")[0]
+    else:
+        host_port, db = host_part, "postgres"
+    if ":" in host_port:
+        host, port = host_port.rsplit(":", 1)
+        port = int(port) if port.isdigit() else 5432
+    else:
+        host, port = host_port, 5432
+    return {"host": host, "port": port, "dbname": db, "user": user, "password": password}
 
-# Detectar configuração de Banco
-DB_URL = get_database_url()
-IS_POSTGRES = False
-
-if DB_URL and "postgres" in DB_URL:
-    try:
-        import psycopg2
-        IS_POSTGRES = True
-    except ImportError:
-        print("⚠️ Driver psycopg2 não encontrado. Para usar PostgreSQL, instale: pip install psycopg2-binary")
-        # Fallback ou Exit? Melhor avisar e continuar com SQLite se falhar?
-        # User especificou URL, espera Postgres.
-        pass
-
-
-DB_NAME = "frota.db"
 
 def get_connection():
-    """Retorna conexão com o banco (SQLite ou PostgreSQL)"""
-    if IS_POSTGRES:
-        return psycopg2.connect(DB_URL)
-    return sqlite3.connect(DB_NAME)
-
-def get_placeholder(count=1):
-    """Retorna string de placeholders SQL correta (? ou %s)"""
-    token = "%s" if IS_POSTGRES else "?"
-    return ", ".join([token] * count)
-
-def init_db():
-    conn = get_connection()
-    c = conn.cursor()
-
-    # Tipos de dados compatíveis
-    if IS_POSTGRES:
-        TYPE_PK_AUTO = "SERIAL PRIMARY KEY"
-        TYPE_PK_MANUAL = "INTEGER PRIMARY KEY" # Para id_sascar
-        TYPE_DATETIME = "TIMESTAMP"
-    else:
-        TYPE_PK_AUTO = "INTEGER PRIMARY KEY AUTOINCREMENT"
-        TYPE_PK_MANUAL = "INTEGER PRIMARY KEY"
-        TYPE_DATETIME = "DATETIME"
-
-    # Tabela: Mapeamento de Veículos (ID Sascar é chave, não auto-inc)
-    c.execute(f'''
-        CREATE TABLE IF NOT EXISTS veiculos (
-            id_sascar {TYPE_PK_MANUAL},
-            placa TEXT NOT NULL
-        )
-    ''')
-
-    # Tabela: Pontos de Interesse (POIs)
-    c.execute(f'''
-        CREATE TABLE IF NOT EXISTS pois (
-            id {TYPE_PK_AUTO},
-            nome TEXT NOT NULL,
-            latitude REAL NOT NULL,
-            longitude REAL NOT NULL,
-            tipo TEXT CHECK(tipo IN ('Base', 'Granja', 'Oficina', 'Concessionaria', 'Posto')) NOT NULL,
-            raio INTEGER DEFAULT 100
-        )
-    ''')
-
-    # Tabela: Dados Brutos de GPS
-    c.execute(f'''
-        CREATE TABLE IF NOT EXISTS posicoes_raw (
-            id {TYPE_PK_AUTO},
-            id_veiculo INTEGER NOT NULL,
-            data_hora {TYPE_DATETIME} NOT NULL,
-            latitude REAL NOT NULL,
-            longitude REAL NOT NULL,
-            odometro REAL,
-            ignicao INTEGER,
-            velocidade REAL,
-            pacote_id INTEGER
-        )
-    ''')
-
-    # Tabela: Viagens (Deve vir antes de Deslocamentos por causa da FK)
-    c.execute(f'''
-        CREATE TABLE IF NOT EXISTS viagens (
-            id {TYPE_PK_AUTO},
-            placa TEXT NOT NULL,
-            data_inicio {TYPE_DATETIME},
-            data_fim {TYPE_DATETIME},
-            tempo_total REAL DEFAULT 0,
-            tempo_parado REAL DEFAULT 0,
-            tempo_motor_off REAL DEFAULT 0,
-            operacao TEXT,
-            rota TEXT,
-            num_cte TEXT,
-            valor REAL DEFAULT 0,
-            distancia_total REAL,
-            tipo_viagem TEXT,
-            observacao TEXT
-        )
-    ''')
-
-    # Tabela: Deslocamentos (v2 - com campos adicionais para rastreabilidade)
-    c.execute(f'''
-        CREATE TABLE IF NOT EXISTS deslocamentos (
-            id {TYPE_PK_AUTO},
-            placa TEXT NOT NULL,
-            data_inicio {TYPE_DATETIME} NOT NULL,
-            data_fim {TYPE_DATETIME} NOT NULL,
-            km_inicial REAL,
-            km_final REAL,
-            distancia REAL,
-            local_inicio TEXT,
-            local_fim TEXT,
-            tempo REAL DEFAULT 0,
-            tempo_ocioso REAL DEFAULT 0,
-            tempo_motor_off REAL DEFAULT 0,
-            situacao TEXT DEFAULT 'MOVIMENTO',
-            tipo_parada TEXT DEFAULT 'MOVIMENTO',
-            qtd_pontos INTEGER DEFAULT 0,
-            raw_id_inicio INTEGER,
-            raw_id_fim INTEGER,
-            status TEXT DEFAULT 'PENDENTE',
-            viagem_id INTEGER,
-            FOREIGN KEY(viagem_id) REFERENCES viagens(id)
-        )
-    ''')
-
-    # Tabela Viagens ja criada acima
+    """Return a new psycopg2 connection. Caller must close."""
+    if not HAS_PSYCOPG2:
+        raise RuntimeError("psycopg2 is required. pip install psycopg2-binary")
+    kwargs = _parse_url(DATABASE_URL)
+    return psycopg2.connect(**kwargs)
 
 
-    conn.commit()
-    
-    # Índices (Sintaxe igual para ambos)
-    print("Verificando índices...")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_posicoes_placa_data ON posicoes_raw(id_veiculo, data_hora)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_deslocamentos_placa_status ON deslocamentos(placa, status)")
-    c.execute("CREATE INDEX IF NOT EXISTS idx_viagens_placa ON viagens(placa)")
-    conn.commit()
-    
-    # Seeding inicial de POIs
-    seed_pois(conn)
-    
-    conn.close()
-    if IS_POSTGRES:
-        print("✅ Banco PostgreSQL inicializado.")
-    else:
-        print("✅ Banco SQLite inicializado.")
+def get_placeholder(n=1):
+    """Return placeholder for parameterized query. PostgreSQL uses %s."""
+    return ", ".join(["%s"] * n)
 
-def seed_pois(conn):
-    c = conn.cursor()
-    c.execute("SELECT count(*) FROM pois")
-    if c.fetchone()[0] > 0:
-        return
-
-    print("Inserindo dados de teste (POIs)...")
-    pois_referencia = [
-        ("Base SP", -23.550520, -46.633308, "Base", 200),
-        ("Granja Modelo", -23.555520, -46.638308, "Granja", 500),
-        ("Oficina Central", -23.560000, -46.640000, "Oficina", 300),
-        ("Posto Descanso", -23.570000, -46.650000, "Posto", 300)
-    ]
-    
-    ph = get_placeholder(5) # ?,?,?,?,? ou %s,%s,%s,%s,%s
-    sql = f"INSERT INTO pois (nome, latitude, longitude, tipo, raio) VALUES ({ph})"
-    
-    c.executemany(sql, pois_referencia)
-    conn.commit()
-
-def manutencao_banco(dias_retencao=30):
-    from datetime import datetime, timedelta
-    
-    conn = get_connection()
-    c = conn.cursor()
-    
-    data_limite = datetime.now() - timedelta(days=dias_retencao)
-    data_limite_str = data_limite.isoformat()
-    
-    print(f"[MANUTENÇÃO] Limpeza anterior a {data_limite.strftime('%d/%m/%Y')}")
-    
-    ph = get_placeholder(1)
-    c.execute(f"SELECT COUNT(*) FROM posicoes_raw WHERE data_hora < {ph}", (data_limite_str,))
-    registros_antigos = c.fetchone()[0]
-    
-    if registros_antigos > 0:
-        c.execute(f"DELETE FROM posicoes_raw WHERE data_hora < {ph}", (data_limite_str,))
-        conn.commit()
-        # VACUUM (funciona no PG também para reclaim space, mas cuidado com lock)
-        # Em PG, autovacuum faz isso. Em SQLite é manual.
-        # Vamos manter apenas para SQLite.
-        if not IS_POSTGRES:
-            c.execute("VACUUM")
-        print(f"[MANUTENÇÃO] {registros_antigos} registros removidos.")
-    
-    conn.close()
-
-def execute_insert_returning_id(cursor, sql, params):
-    """Executa INSERT e retorna o ID do novo registro, compatível com PG/SQLite"""
-    if IS_POSTGRES:
-        if "RETURNING" not in sql.upper():
-            sql += " RETURNING id"
-        cursor.execute(sql, params)
-        row = cursor.fetchone()
-        return row[0] if row else None
-    else:
-        cursor.execute(sql, params)
-        return cursor.lastrowid
 
 def get_pois():
-    """Retorna todos os POIs do banco de dados"""
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT id, nome, latitude, longitude, tipo, raio FROM pois")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+    """Return list of POI dicts from poi_data.py."""
+    try:
+        from poi_data import POIS_NUPORANGA, POI_RADIUS
+        return [(name, coords_list, POI_RADIUS) for name, coords_list in POIS_NUPORANGA.items()]
+    except ImportError:
+        return []
+
 
 def migrate_db():
-    """
-    Migração segura: Adiciona novas colunas se não existirem.
-    Pode ser executado várias vezes sem problemas.
-    """
-    conn = get_connection()
-    c = conn.cursor()
-    
-    # Lista de migrações: (nome_coluna, definição_sql)
-    migrations = [
-        ("tipo_parada", "TEXT DEFAULT 'MOVIMENTO'"),
-        ("qtd_pontos", "INTEGER DEFAULT 0"),
-        ("raw_id_inicio", "INTEGER"),
-        ("raw_id_fim", "INTEGER"),
-        ("tempo_motor_off", "REAL DEFAULT 0"),
-    ]
-    
-    for col_name, col_def in migrations:
-        try:
-            if IS_POSTGRES:
-                c.execute(f"ALTER TABLE deslocamentos ADD COLUMN IF NOT EXISTS {col_name} {col_def}")
-            else:
-                # SQLite não tem IF NOT EXISTS para ADD COLUMN
-                c.execute(f"ALTER TABLE deslocamentos ADD COLUMN {col_name} {col_def}")
-        except Exception as e:
-            # Coluna já existe (SQLite lança erro)
-            if "duplicate column" not in str(e).lower() and "already exists" not in str(e).lower():
-                print(f"⚠️ Migração {col_name}: {e}")
-    
-    conn.commit()
-    conn.close()
-    print("✅ Migração do banco concluída.")
+    """Legacy: ensure deslocamentos table has expected columns. No-op in new schema."""
+    pass
 
-if __name__ == "__main__":
-    init_db()
-    migrate_db()
+
+def manutencao_banco(dias_retencao=30):
+    """Optional maintenance: e.g. archive old raw data. No-op by default."""
+    pass
+
+
+@contextmanager
+def connection_scope():
+    """Context manager for a connection (auto commit/rollback and close)."""
+    conn = get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
