@@ -77,9 +77,9 @@ def process_plate(placa: str, truck_id: int, start_date: datetime = None, end_da
     
     print(f"  📍 {placa}...", end=" ", flush=True)
     
-    # Clear old
+    # Clear old - ONLY within the processing window to support incremental updates
     with engine.connect() as conn:
-        conn.execute(text(f"DELETE FROM deslocamentos WHERE placa = '{placa}' AND validado = FALSE"))
+        conn.execute(text(f"DELETE FROM deslocamentos WHERE placa = '{placa}' AND validado = FALSE AND data_inicio >= '{start_date}'"))
         conn.commit()
     
     # Fetch GPS
