@@ -1,19 +1,21 @@
-
-# Ambientes e Dependências
-.venv/
-venv/
-env/
+# Python
 __pycache__/
-*.pyc
-
-# Banco de Dados e Secrets
+*.py[cod]
+*$py.class
+*.so
 .env
-frota.db
-*.sqlite3
+venv/
+.venv/
 
-# IDEs
-.vscode/
-.idea/
+# Mapa IBGE (baixado automaticamente)
+utils/*.shp
+utils/*.shx
+utils/*.dbf
+utils/*.zip
+utils/*.cpg
+utils/*.prj
+utils/BR_Municipios*
 
 # Streamlit
-.streamlit/secrets.toml
+.streamlit/
+*.log
